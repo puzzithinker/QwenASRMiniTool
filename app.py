@@ -436,8 +436,8 @@ class RealtimeManager:
                         )
                         if text:
                             self.on_text(text)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        self.on_status(f"⚠ 轉錄錯誤：{_e}")
                     buf = []; sil = 0
                     h = np.zeros((2, 1, 64), dtype=np.float32)
                     c = np.zeros((2, 1, 64), dtype=np.float32)

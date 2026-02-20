@@ -69,6 +69,7 @@ REM Chinese Windows (cp950 default encoding).
     --add-data "%SRC%\prompt_template.json;." ^
     --add-data "%SRC%\ov_models\mel_filters.npy;ov_models" ^
     --runtime-hook "%SRC%\runtime_hook_utf8.py" ^
+    --collect-all tokenizers ^
     --hidden-import openvino ^
     --hidden-import openvino.runtime ^
     --hidden-import onnxruntime ^

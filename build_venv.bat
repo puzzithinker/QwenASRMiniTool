@@ -35,6 +35,10 @@ REM GUI + text
 %PIP% install customtkinter --quiet
 %PIP% install opencc-python-reimplemented --quiet
 
+REM BPE tokenizer (required for hint/context encoding in processor_numpy.py)
+REM Note: transformers is excluded from build_venv, so tokenizers must be explicit
+%PIP% install tokenizers --quiet
+
 REM Speaker diarization (segmentation + embedding models)
 %PIP% install kaldi-native-fbank --quiet
 %PIP% install scipy --quiet
