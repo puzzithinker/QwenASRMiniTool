@@ -18,6 +18,7 @@ print("載入 qwen_asr processor…")
 import qwen_asr  # noqa
 from qwen_asr.inference.qwen3_asr import (
     Qwen3ASRConfig, Qwen3ASRForConditionalGeneration, Qwen3ASRProcessor,
+    SUPPORTED_LANGUAGES,
 )
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
@@ -70,16 +71,31 @@ print(f"EOS id        = {eos_id}")
 print(f"EOT id        = {eot_id}")
 print(f"Special token count: {len(special_ids)}")
 
+# ── 預計算所有語系的強制語系 suffix IDs ─────────────────────────────
+# 格式：語系名稱 → [language_id..., lang_name_id..., asr_text_id]
+# 推理時附加到 suffix_ids 之後，讓 decoder 直接生成文字內容（不含語系前綴）
+ASR_TEXT_ID = processor.tokenizer.convert_tokens_to_ids("<asr_text>")
+print(f"asr_text_id   = {ASR_TEXT_ID}")
+
+language_suffix_ids: dict[str, list[int]] = {}
+for lang in SUPPORTED_LANGUAGES:
+    ids = processor.tokenizer.encode(f"language {lang}", add_special_tokens=False)
+    language_suffix_ids[lang] = ids + [ASR_TEXT_ID]
+print(f"語系數量：{len(language_suffix_ids)}")
+
 # ── 儲存 ──────────────────────────────────────────────────────────
 template = {
-    "prefix_ids":     prefix_ids,
-    "suffix_ids":     suffix_ids,
-    "n_audio_tokens": len(pad_positions),
-    "audio_pad_id":   AUDIO_PAD_ID,
-    "eos_id":         eos_id,
-    "eot_id":         eot_id,
-    "special_ids":    sorted(special_ids),
-    "prompt_text":    prompt_text,
+    "prefix_ids":          prefix_ids,
+    "suffix_ids":          suffix_ids,
+    "n_audio_tokens":      len(pad_positions),
+    "audio_pad_id":        AUDIO_PAD_ID,
+    "eos_id":              eos_id,
+    "eot_id":              eot_id,
+    "special_ids":         sorted(special_ids),
+    "prompt_text":         prompt_text,
+    "asr_text_id":         ASR_TEXT_ID,
+    "language_suffix_ids": language_suffix_ids,
+    "supported_languages": list(SUPPORTED_LANGUAGES),
 }
 with open(OUT_PATH, "w", encoding="utf-8") as f:
     json.dump(template, f, indent=2, ensure_ascii=False)
@@ -95,3 +111,4 @@ print(f"mel_filters shape: {mel_filters.shape} → {mel_filters_path}")
 print(f"\n✅  已儲存至 {OUT_PATH}")
 print(f"✅  mel_filters 儲存至 {mel_filters_path}")
 print(f"    prefix={len(prefix_ids)} tokens, audio_pad={len(pad_positions)}, suffix={len(suffix_ids)} tokens")
+print(f"    語系 suffix IDs 已預計算（{len(language_suffix_ids)} 種語系）")

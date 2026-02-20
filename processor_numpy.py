@@ -186,6 +186,7 @@ class LightProcessor:
         pad_id  : int   ← <|audio_pad|> 的 token id
         eos_id  : int   ← <|im_end|>
         eot_id  : int   ← <|endoftext|>
+        supported_languages : list[str]  ← 支援的語系名稱清單
     """
 
     def __init__(self, model_dir: Path):
@@ -195,6 +196,7 @@ class LightProcessor:
         """
         # ── 預先載入 mel filters（避免 extract_mel 每次重找路徑）─────
         _load_mel_filters(model_dir)
+        self._model_dir = model_dir
 
         # ── 讀取 prompt template ──────────────────────────────────────
         # 搜尋順序：BASE_DIR → OV_DIR → 本檔案同層（PyInstaller _internal/）
@@ -214,6 +216,15 @@ class LightProcessor:
         self.eot_id:      int        = tpl["eot_id"]
         self._special_ids: set[int]  = set(tpl["special_ids"])
 
+        # ── 語系相關（供 UI 顯示與強制語系功能）──────────────────────
+        self._language_suffix_ids: dict[str, list[int]] = tpl.get("language_suffix_ids", {})
+        self.supported_languages: list[str] = tpl.get("supported_languages", list(self._language_suffix_ids.keys()))
+
+        # prefix 結構：[im_start, system, \n] | [im_end, \n, im_start, user, \n, audio_start]
+        # context 插入位置：prefix[:3] + encode(context) + prefix[3:]
+        self._prefix_sys_head: list[int] = self._prefix_ids[:3]   # 3 tokens
+        self._prefix_sys_tail: list[int] = self._prefix_ids[3:]   # 6 tokens
+
         # ── 建立 id → token string 的對映（BPE decode 用）────────────
         vocab_path = model_dir / "vocab.json"
         with open(vocab_path, "r", encoding="utf-8") as f:
@@ -232,21 +243,77 @@ class LightProcessor:
             [self.pad_id] * self._n_audio, dtype=np.int64
         )
 
+        # BPE 編碼器：延遲初始化，僅在需要 context hint 時才載入
+        self._bpe_tokenizer = None
+
+    # ── BPE 編碼器（用於 context/hint 動態 tokenize）────────────────
+
+    def _get_bpe_tokenizer(self):
+        """
+        延遲載入 BPE tokenizer（使用 tokenizers 套件，純 Rust 實作）。
+        從 vocab.json + merges.txt 建立，不需 transformers。
+        """
+        if self._bpe_tokenizer is not None:
+            return self._bpe_tokenizer
+        try:
+            from tokenizers import Tokenizer
+            from tokenizers.models import BPE
+            from tokenizers.pre_tokenizers import ByteLevel
+
+            bpe = BPE.from_file(
+                str(self._model_dir / "vocab.json"),
+                str(self._model_dir / "merges.txt"),
+                unk_token="<|endoftext|>",
+            )
+            tok = Tokenizer(bpe)
+            tok.pre_tokenizer = ByteLevel(add_prefix_space=False)
+            self._bpe_tokenizer = tok
+        except ImportError:
+            raise ImportError(
+                "需要 tokenizers 套件才能使用 hint 功能：pip install tokenizers"
+            )
+        return self._bpe_tokenizer
+
+    def encode_text(self, text: str) -> list[int]:
+        """將任意文字 BPE encode 為 token IDs（用於 hint/context）。"""
+        return self._get_bpe_tokenizer().encode(text).ids
+
     # ── 外部 API ──────────────────────────────────────────────────────
 
-    def prepare(self, audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def prepare(
+        self,
+        audio: np.ndarray,
+        language: str | None = None,
+        context: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
         輸入：16kHz float32 音頻
+        參數：
+            language : 強制語系名稱（如 "Chinese"、"English"），None 表示自動偵測
+            context  : 辨識提示（歌詞、關鍵字等），放入 system message
         輸出：(mel, input_ids)
             mel       : [1, 128, 3000] float32
             input_ids : [1, L]         int64
         """
         mel = extract_mel(audio)
 
+        # ── 組裝 prefix（含 context/hint）────────────────────────────
+        if context and context.strip():
+            ctx_ids = self.encode_text(context.strip())
+            prefix_ids = self._prefix_sys_head + ctx_ids + self._prefix_sys_tail
+        else:
+            prefix_ids = self._prefix_ids
+
+        # ── 組裝 suffix（含強制語系）─────────────────────────────────
+        if language and language in self._language_suffix_ids:
+            suffix_ids = self._suffix_ids + self._language_suffix_ids[language]
+        else:
+            suffix_ids = self._suffix_ids
+
         ids = np.array(
-            self._prefix_ids + [self.pad_id] * self._n_audio + self._suffix_ids,
+            prefix_ids + [self.pad_id] * self._n_audio + suffix_ids,
             dtype=np.int64,
-        )[np.newaxis, :]     # (1, 9+390+6=405)
+        )[np.newaxis, :]
 
         return mel, ids
 

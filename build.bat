@@ -50,6 +50,10 @@ REM _internal/ keeps the root folder tidy (PyInstaller >= 6.0).
 REM
 REM prompt_template.json and mel_filters.npy are bundled inside _internal/
 REM so LightProcessor can find them via Path(__file__).parent fallback.
+REM
+REM runtime_hook_utf8.py: sets PYTHONUTF8=1 before any user code runs.
+REM This prevents "utf-8 codec can't decode byte 0xa6" on Traditional
+REM Chinese Windows (cp950 default encoding).
 
 %PYTHON% -m PyInstaller ^
     --onedir ^
@@ -61,6 +65,7 @@ REM so LightProcessor can find them via Path(__file__).parent fallback.
     --add-data "%OV_PKG%;openvino" ^
     --add-data "%SRC%\prompt_template.json;." ^
     --add-data "%SRC%\ov_models\mel_filters.npy;ov_models" ^
+    --runtime-hook "%SRC%\runtime_hook_utf8.py" ^
     --hidden-import openvino ^
     --hidden-import openvino.runtime ^
     --hidden-import onnxruntime ^

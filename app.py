@@ -7,6 +7,20 @@ Qwen3 ASR 字幕生成器 - CustomTkinter 前端
 """
 from __future__ import annotations
 
+# ── UTF-8 模式：在所有其他 import 之前設定 ────────────────────────────
+# 解決 Traditional Chinese Windows（cp950）上第三方套件用系統預設編碼
+# 讀取 UTF-8 檔案時出現 "utf-8 codec can't decode byte 0xa6" 的問題。
+# PYTHONUTF8=1 等效於 `python -X utf8`，讓所有 open() 預設使用 UTF-8。
+import os as _os, sys as _sys, io as _io
+_os.environ.setdefault("PYTHONUTF8", "1")
+# 同步修正 stdout/stderr（避免 print 中文在 cp950 console 出錯）
+for _stream_name in ("stdout", "stderr"):
+    _s = getattr(_sys, _stream_name)
+    if hasattr(_s, "buffer") and _s.encoding.lower() not in ("utf-8", "utf8"):
+        setattr(_sys, _stream_name,
+                _io.TextIOWrapper(_s.buffer, encoding="utf-8", errors="replace"))
+del _os, _sys, _io, _stream_name, _s
+
 import json
 import os
 import re
@@ -201,11 +215,20 @@ class ASREngine:
         self.ready     = True
         _s(f"編譯完成（{device}）")
 
-    def transcribe(self, audio: np.ndarray, max_tokens: int = 300) -> str:
-        """將 16kHz float32 音訊轉錄為繁體中文。"""
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        max_tokens: int = 300,
+        language: str | None = None,
+        context: str | None = None,
+    ) -> str:
+        """將 16kHz float32 音訊轉錄為繁體中文。
+        language : 強制語系（如 "Chinese"），None 表示自動偵測
+        context  : 辨識提示（歌詞/關鍵字），放入 system message
+        """
         with self._lock:
             # ── 前處理（純 numpy，不需 torch）────────────────────────
-            mel, ids = self.processor.prepare(audio)
+            mel, ids = self.processor.prepare(audio, language=language, context=context)
 
             # ── 音頻編碼 + 文字 Embedding ────────────────────────────
             ae = list(self.audio_enc({"mel": mel}).values())[0]
@@ -250,9 +273,16 @@ class ASREngine:
             return self.cc.convert(raw.strip())
 
     def process_file(
-        self, audio_path: Path, progress_cb=None
+        self,
+        audio_path: Path,
+        progress_cb=None,
+        language: str | None = None,
+        context: str | None = None,
     ) -> Path | None:
-        """音檔 → SRT，回傳 SRT 路徑。"""
+        """音檔 → SRT，回傳 SRT 路徑。
+        language : 強制語系（如 "Chinese"），None 表示自動偵測
+        context  : 辨識提示（歌詞/關鍵字），放入 system message
+        """
         import librosa
         audio, _ = librosa.load(str(audio_path), sr=SAMPLE_RATE, mono=True)
         groups = _detect_speech_groups(audio, self.vad_sess)
@@ -263,7 +293,7 @@ class ASREngine:
         for i, (g0, g1, chunk) in enumerate(groups):
             if progress_cb:
                 progress_cb(i, len(groups), f"[{i+1}/{len(groups)}] {g0:.1f}s ~ {g1:.1f}s")
-            text = self.transcribe(chunk)
+            text = self.transcribe(chunk, language=language, context=context)
             if not text:
                 continue
             lines = _split_to_lines(text)
@@ -286,11 +316,21 @@ class ASREngine:
 class RealtimeManager:
     """sounddevice 串流 + VAD + 緩衝轉錄。"""
 
-    def __init__(self, asr: ASREngine, device_idx: int, on_text, on_status):
+    def __init__(
+        self,
+        asr: ASREngine,
+        device_idx: int,
+        on_text,
+        on_status,
+        language: str | None = None,
+        context: str | None = None,
+    ):
         self.asr       = asr
         self.dev_idx   = device_idx
         self.on_text   = on_text    # callback(text: str)
         self.on_status = on_status  # callback(msg: str)
+        self.language  = language
+        self.context   = context
         self._q        = queue.Queue()
         self._running  = False
         self._stream   = None
@@ -348,7 +388,11 @@ class RealtimeManager:
                     audio = np.concatenate(buf)
                     n = max(1, len(audio) // SAMPLE_RATE) * SAMPLE_RATE
                     try:
-                        text = self.asr.transcribe(audio[:n])
+                        text = self.asr.transcribe(
+                            audio[:n],
+                            language=self.language,
+                            context=self.context,
+                        )
                         if text:
                             self.on_text(text)
                     except Exception:
@@ -386,6 +430,9 @@ class App(ctk.CTk):
         self._converting                     = False
         self._dev_idx_map: dict[str, int]    = {}
         self._model_dir: Path | None         = None   # 使用者選定的模型路徑
+        self._lang_list: list[str]           = []     # 載入後填入
+        self._selected_language: str | None  = None   # 目前選定的語系
+        self._file_hint: str | None          = None   # 音檔轉字幕 hint
 
         self._build_ui()
         self._detect_ov_devices()
@@ -426,6 +473,16 @@ class App(ctk.CTk):
             command=self._on_reload_models,
         )
         self.reload_btn.pack(side="left", padx=8, pady=12)
+
+        ctk.CTkLabel(dev_bar, text="語系：", font=FONT_BODY).pack(
+            side="left", padx=(12, 2), pady=12
+        )
+        self.lang_var   = ctk.StringVar(value="自動偵測")
+        self.lang_combo = ctk.CTkComboBox(
+            dev_bar, values=["自動偵測"], variable=self.lang_var,
+            width=130, state="disabled", font=FONT_BODY,
+        )
+        self.lang_combo.pack(side="left", pady=12)
 
         self.status_dot = ctk.CTkLabel(
             dev_bar, text="⏳ 啟動中…",
@@ -483,9 +540,28 @@ class App(ctk.CTk):
         )
         self.open_dir_btn.pack(side="left")
 
+        # 辨識提示（Hint / Context）
+        hint_hdr = ctk.CTkFrame(parent, fg_color="transparent")
+        hint_hdr.pack(fill="x", padx=8, pady=(6, 0))
+        ctk.CTkLabel(
+            hint_hdr, text="辨識提示（可選）：", font=FONT_BODY,
+            text_color="#AAAAAA", anchor="w",
+        ).pack(side="left")
+        ctk.CTkLabel(
+            hint_hdr,
+            text="貼入歌詞、關鍵字或背景說明，可提升辨識準確度",
+            font=("Microsoft JhengHei", 11),
+            text_color="#555555",
+        ).pack(side="left", padx=(6, 0))
+
+        self.hint_box = ctk.CTkTextbox(
+            parent, font=FONT_MONO, height=72,
+        )
+        self.hint_box.pack(fill="x", padx=8, pady=(2, 4))
+
         # 進度
         prog_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        prog_frame.pack(fill="x", padx=8, pady=(6, 2))
+        prog_frame.pack(fill="x", padx=8, pady=(4, 2))
 
         self.prog_label = ctk.CTkLabel(
             prog_frame, text="", font=FONT_BODY,
@@ -528,6 +604,18 @@ class App(ctk.CTk):
             font=FONT_BODY, fg_color="gray35", hover_color="gray25",
             command=self._refresh_audio_devices,
         ).pack(side="left", padx=8)
+
+        # Hint 輸入列（即時模式）
+        hint_row = ctk.CTkFrame(parent, fg_color="transparent")
+        hint_row.pack(fill="x", padx=8, pady=(0, 4))
+        ctk.CTkLabel(hint_row, text="辨識提示：", font=FONT_BODY,
+                     text_color="#AAAAAA").pack(side="left", padx=(0, 6))
+        self.rt_hint_entry = ctk.CTkEntry(
+            hint_row,
+            placeholder_text="（可選）貼入歌詞、關鍵字或說明文字…",
+            font=FONT_BODY, height=30,
+        )
+        self.rt_hint_entry.pack(side="left", fill="x", expand=True)
 
         # 控制按鈕列
         btn_row = ctk.CTkFrame(parent, fg_color="transparent")
@@ -766,6 +854,12 @@ class App(ctk.CTk):
         self.rt_start_btn.configure(state="normal")
         device = self.device_var.get()
         self._set_status(f"✅ 就緒（{device}）")
+        # 填入語系清單（模型載入後才知道 supported_languages）
+        if self.engine.processor and self.engine.processor.supported_languages:
+            langs = ["自動偵測"] + self.engine.processor.supported_languages
+            self._lang_list = self.engine.processor.supported_languages
+            self.lang_combo.configure(values=langs, state="readonly")
+            self.lang_var.set("自動偵測")
 
     def _on_models_failed(self, device: str, reason: str):
         """模型載入失敗：還原 UI，讓使用者可以切換裝置後重試。"""
@@ -847,6 +941,12 @@ class App(ctk.CTk):
             return
 
         self._audio_file = path
+        # 讀取語系與 hint（在主執行緒讀取 UI 值，再傳給 worker）
+        lang_sel = self.lang_var.get()
+        self._selected_language = lang_sel if lang_sel != "自動偵測" else None
+        hint_text = self.hint_box.get("1.0", "end").strip()
+        self._file_hint = hint_text if hint_text else None
+
         self._converting = True
         self.convert_btn.configure(state="disabled", text="轉換中…")
         self.prog_bar.set(0)
@@ -856,6 +956,10 @@ class App(ctk.CTk):
     def _convert_worker(self):
         path = self._audio_file
 
+        # 擷取語系與 hint（在主執行緒已取好，直接帶入 worker）
+        language = self._selected_language
+        context  = self._file_hint
+
         def prog_cb(done, total, msg):
             pct = done / total if total > 0 else 0
             self.after(0, lambda: self.prog_bar.set(pct))
@@ -864,8 +968,12 @@ class App(ctk.CTk):
 
         try:
             t0 = time.perf_counter()
-            self._file_log(f"開始處理：{path.name}")
-            srt     = self.engine.process_file(path, progress_cb=prog_cb)
+            lang_info = f"  語系：{language or '自動'}"
+            hint_info = f"  提示：{context[:30]}…" if context and len(context) > 30 else (f"  提示：{context}" if context else "")
+            self._file_log(f"開始處理：{path.name}{lang_info}{hint_info}")
+            srt = self.engine.process_file(
+                path, progress_cb=prog_cb, language=language, context=context
+            )
             elapsed = time.perf_counter() - t0
 
             if srt:
@@ -911,11 +1019,17 @@ class App(ctk.CTk):
             messagebox.showwarning("提示", "請選擇有效的音訊輸入裝置")
             return
 
+        lang_sel = self.lang_var.get()
+        rt_lang  = lang_sel if lang_sel != "自動偵測" else None
+        rt_hint  = self.rt_hint_entry.get().strip() or None
+
         self._rt_mgr = RealtimeManager(
             asr=self.engine,
             device_idx=idx,
             on_text=self._on_rt_text,
             on_status=self._on_rt_status,
+            language=rt_lang,
+            context=rt_hint,
         )
         try:
             self._rt_mgr.start()

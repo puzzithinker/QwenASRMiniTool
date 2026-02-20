@@ -72,5 +72,192 @@
     151702,
     151703
   ],
-  "prompt_text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n"
+  "prompt_text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n",
+  "asr_text_id": 151704,
+  "language_suffix_ids": {
+    "Chinese": [
+      11528,
+      8453,
+      151704
+    ],
+    "English": [
+      11528,
+      6364,
+      151704
+    ],
+    "Cantonese": [
+      11528,
+      72366,
+      2367,
+      151704
+    ],
+    "Arabic": [
+      11528,
+      34117,
+      151704
+    ],
+    "German": [
+      11528,
+      5938,
+      151704
+    ],
+    "French": [
+      11528,
+      8585,
+      151704
+    ],
+    "Spanish": [
+      11528,
+      15154,
+      151704
+    ],
+    "Portuguese": [
+      11528,
+      42188,
+      151704
+    ],
+    "Indonesian": [
+      11528,
+      58829,
+      151704
+    ],
+    "Italian": [
+      11528,
+      14811,
+      151704
+    ],
+    "Korean": [
+      11528,
+      16134,
+      151704
+    ],
+    "Russian": [
+      11528,
+      8522,
+      151704
+    ],
+    "Thai": [
+      11528,
+      26392,
+      151704
+    ],
+    "Vietnamese": [
+      11528,
+      48477,
+      151704
+    ],
+    "Japanese": [
+      11528,
+      10769,
+      151704
+    ],
+    "Turkish": [
+      11528,
+      23734,
+      151704
+    ],
+    "Hindi": [
+      11528,
+      43980,
+      151704
+    ],
+    "Malay": [
+      11528,
+      79140,
+      151704
+    ],
+    "Dutch": [
+      11528,
+      23234,
+      151704
+    ],
+    "Swedish": [
+      11528,
+      30109,
+      151704
+    ],
+    "Danish": [
+      11528,
+      43680,
+      151704
+    ],
+    "Finnish": [
+      11528,
+      57853,
+      151704
+    ],
+    "Polish": [
+      11528,
+      31984,
+      151704
+    ],
+    "Czech": [
+      11528,
+      33150,
+      151704
+    ],
+    "Filipino": [
+      11528,
+      62417,
+      151704
+    ],
+    "Persian": [
+      11528,
+      49861,
+      151704
+    ],
+    "Greek": [
+      11528,
+      17860,
+      151704
+    ],
+    "Romanian": [
+      11528,
+      73597,
+      151704
+    ],
+    "Hungarian": [
+      11528,
+      56769,
+      151704
+    ],
+    "Macedonian": [
+      11528,
+      56452,
+      75491,
+      151704
+    ]
+  },
+  "supported_languages": [
+    "Chinese",
+    "English",
+    "Cantonese",
+    "Arabic",
+    "German",
+    "French",
+    "Spanish",
+    "Portuguese",
+    "Indonesian",
+    "Italian",
+    "Korean",
+    "Russian",
+    "Thai",
+    "Vietnamese",
+    "Japanese",
+    "Turkish",
+    "Hindi",
+    "Malay",
+    "Dutch",
+    "Swedish",
+    "Danish",
+    "Finnish",
+    "Polish",
+    "Czech",
+    "Filipino",
+    "Persian",
+    "Greek",
+    "Romanian",
+    "Hungarian",
+    "Macedonian"
+  ]
 }
