@@ -37,10 +37,12 @@ echo === Step 2: Locate dependency paths ===
 FOR /F "delims=" %%i IN ('%PYTHON% -c "import opencc, os; print(os.path.dirname(opencc.__file__))"') DO SET OPENCC_DIR=%%i
 FOR /F "delims=" %%i IN ('%PYTHON% -c "import customtkinter, os; print(os.path.dirname(customtkinter.__file__))"') DO SET CTK_DIR=%%i
 FOR /F "delims=" %%i IN ('%PYTHON% -c "import openvino, os; print(os.path.dirname(openvino.__file__))"') DO SET OV_PKG=%%i
+FOR /F "delims=" %%i IN ('%PYTHON% -c "import kaldi_native_fbank, os; print(os.path.dirname(kaldi_native_fbank.__file__))"') DO SET KNF_DIR=%%i
 
-echo opencc       : %OPENCC_DIR%
-echo customtkinter: %CTK_DIR%
-echo openvino     : %OV_PKG%
+echo opencc            : %OPENCC_DIR%
+echo customtkinter     : %CTK_DIR%
+echo openvino          : %OV_PKG%
+echo kaldi_native_fbank: %KNF_DIR%
 
 echo.
 echo === Step 3: Build with PyInstaller (onedir) ===
@@ -63,6 +65,7 @@ REM Chinese Windows (cp950 default encoding).
     --add-data "%CTK_DIR%;customtkinter" ^
     --add-data "%OPENCC_DIR%;opencc" ^
     --add-data "%OV_PKG%;openvino" ^
+    --add-data "%KNF_DIR%;kaldi_native_fbank" ^
     --add-data "%SRC%\prompt_template.json;." ^
     --add-data "%SRC%\ov_models\mel_filters.npy;ov_models" ^
     --runtime-hook "%SRC%\runtime_hook_utf8.py" ^
@@ -73,6 +76,13 @@ REM Chinese Windows (cp950 default encoding).
     --hidden-import customtkinter ^
     --hidden-import sounddevice ^
     --hidden-import librosa ^
+    --hidden-import kaldi_native_fbank ^
+    --hidden-import scipy ^
+    --hidden-import scipy.cluster ^
+    --hidden-import scipy.cluster.hierarchy ^
+    --hidden-import scipy.spatial ^
+    --hidden-import scipy.spatial.distance ^
+    --hidden-import scipy._lib.messagestream ^
     --exclude-module torch ^
     --exclude-module torchvision ^
     --exclude-module torchaudio ^

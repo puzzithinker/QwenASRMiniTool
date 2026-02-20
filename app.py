@@ -1004,9 +1004,76 @@ class App(ctk.CTk):
             self._lang_list = self.engine.processor.supported_languages
             self.lang_combo.configure(values=langs, state="readonly")
             self.lang_var.set("自動偵測")
-        # 說話者分離 checkbox（僅在模型可用時啟用）
+        # 說話者分離 checkbox
         if self.engine.diar_engine and self.engine.diar_engine.ready:
             self.diarize_chk.configure(state="normal")
+        else:
+            # 模型未就緒：背景確認是否需要下載
+            threading.Thread(
+                target=self._check_diarization_models, daemon=True
+            ).start()
+
+    # ── 說話者分離模型：啟動時檢查 + 按需下載 ─────────────────────────
+
+    def _check_diarization_models(self):
+        """背景執行緒：若說話者分離模型不存在，則在主執行緒詢問使用者。"""
+        from downloader import quick_check_diarization
+        if self._model_dir and not quick_check_diarization(self._model_dir):
+            self.after(0, self._ask_download_diarization)
+
+    def _ask_download_diarization(self):
+        """主執行緒：詢問使用者是否下載說話者分離模型（約 32 MB）。"""
+        answer = messagebox.askyesno(
+            "說話者分離模型",
+            "說話者分離功能需要額外下載模型（約 32 MB）：\n"
+            "  • segmentation-community-1.onnx\n"
+            "  • embedding_model.onnx\n\n"
+            "是否立即下載？（選「否」可稍後透過重新載入模型觸發）",
+        )
+        if answer:
+            threading.Thread(
+                target=self._download_diarization_models, daemon=True
+            ).start()
+
+    def _download_diarization_models(self):
+        """背景執行緒：下載說話者分離模型，完成後重新載入 DiarizationEngine。"""
+        from downloader import download_diarization
+        from diarize import DiarizationEngine
+
+        diar_dir = self._model_dir / "diarization"
+        self.after(0, self._show_dl_bar)
+        self._set_status("⬇ 下載說話者分離模型…")
+        try:
+            download_diarization(diar_dir, progress_cb=self._on_dl_progress)
+        except Exception as e:
+            msg = str(e)
+            self.after(0, self._hide_dl_bar)
+            self.after(0, lambda: messagebox.showerror(
+                "下載失敗",
+                f"說話者分離模型下載失敗：\n{msg}\n\n請確認網路連線後重試。",
+            ))
+            self.after(0, lambda: self._set_status("❌ 下載失敗"))
+            return
+
+        self.after(0, self._hide_dl_bar)
+
+        # 重新載入 DiarizationEngine
+        try:
+            eng = DiarizationEngine(diar_dir)
+            if eng.ready:
+                self.engine.diar_engine = eng
+                self.after(0, lambda: self.diarize_chk.configure(state="normal"))
+                device = self.device_var.get()
+                self.after(0, lambda: self._set_status(f"✅ 就緒（{device}）"))
+            else:
+                self.after(0, lambda: messagebox.showerror(
+                    "載入失敗", "說話者分離模型下載完成，但無法正常載入，請重新啟動程式。"
+                ))
+        except Exception as e:
+            err = str(e)
+            self.after(0, lambda: messagebox.showerror(
+                "載入失敗", f"說話者分離模型載入失敗：{err}"
+            ))
 
     def _on_models_failed(self, device: str, reason: str):
         """模型載入失敗：還原 UI，讓使用者可以切換裝置後重試。"""

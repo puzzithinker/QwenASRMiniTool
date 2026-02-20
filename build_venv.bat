@@ -35,6 +35,10 @@ REM GUI + text
 %PIP% install customtkinter --quiet
 %PIP% install opencc-python-reimplemented --quiet
 
+REM Speaker diarization (segmentation + embedding models)
+%PIP% install kaldi-native-fbank --quiet
+%PIP% install scipy --quiet
+
 REM (huggingface_hub removed - downloader uses urllib stdlib directly)
 
 REM PyInstaller

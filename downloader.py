@@ -36,6 +36,13 @@ _HF_BASE  = _HF_BASE_PRIMARY   # 相容舊版引用
 _VAD_URL  = "https://github.com/snakers4/silero-vad/raw/v4.0/files/silero_vad.onnx"
 _UA       = "Mozilla/5.0 (compatible; QwenASR-downloader)"
 
+# ── 說話者分離模型（直接 URL，非 HF API）──────────────────────────────
+_DIAR_BASE = "https://huggingface.co/altunenes/speaker-diarization-community-1-onnx/resolve/main"
+DIAR_FILES: dict[str, str] = {
+    "segmentation-community-1.onnx": f"{_DIAR_BASE}/segmentation-community-1.onnx",
+    "embedding_model.onnx":          f"{_DIAR_BASE}/embedding_model.onnx",
+}
+
 # ── 必要檔案清單 ───────────────────────────────────────────────────────
 # 大型 .bin 附 SHA256；小型設定檔只檢查存在即可。
 REQUIRED_BIN: dict[str, str] = {
@@ -58,6 +65,49 @@ REQUIRED_OTHER: list[str] = [
 def _get_paths(model_dir: Path) -> tuple[Path, Path]:
     """回傳 (ov_dir, vad_path)。"""
     return model_dir / "qwen3_asr_int8", model_dir / "silero_vad_v4.onnx"
+
+
+def quick_check_diarization(model_dir: Path) -> bool:
+    """快速檢查說話者分離模型是否存在（只檢查檔案存在，不驗證雜湊）。"""
+    diar_dir = model_dir / "diarization"
+    return all((diar_dir / fname).exists() for fname in DIAR_FILES)
+
+
+def download_diarization(diar_dir: Path, progress_cb=None):
+    """
+    下載說話者分離 ONNX 模型至 diar_dir。
+    progress_cb(pct: float, msg: str)   pct ∈ [0, 1]
+    下載失敗時拋出例外。
+    """
+    diar_dir.mkdir(parents=True, exist_ok=True)
+    total_tasks = len(DIAR_FILES)
+
+    for idx, (fname, url) in enumerate(DIAR_FILES.items()):
+        dest = diar_dir / fname
+        if dest.exists():
+            if progress_cb:
+                progress_cb((idx + 1) / total_tasks, f"✅ {fname}（已存在）")
+            continue
+
+        base_pct = idx / total_tasks
+        span_pct = 1.0 / total_tasks
+        if progress_cb:
+            progress_cb(base_pct, f"下載 {fname}…")
+
+        def _file_cb(done: int, total: int,
+                     _b=base_pct, _s=span_pct, _f=fname):
+            if progress_cb and total > 0:
+                progress_cb(
+                    _b + _s * done / total,
+                    f"下載 {_f}…  {done/1_048_576:.1f} / {total/1_048_576:.1f} MB",
+                )
+
+        _download_file(url, dest, progress_cb=_file_cb)
+        if progress_cb:
+            progress_cb(base_pct + span_pct, f"✅ {fname}")
+
+    if progress_cb:
+        progress_cb(1.0, "說話者分離模型下載完成！")
 
 
 # ══════════════════════════════════════════════════════════════════════
