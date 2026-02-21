@@ -24,7 +24,7 @@ sounddevice>=0.4.6
 opencc-python-reimplemented>=0.1.7
 
 # Web frontend
-streamlit>=1.31.0
+streamlit>=1.46.0
 
 # Model download helper
 huggingface_hub>=0.20.0
