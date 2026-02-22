@@ -19,6 +19,10 @@ env/
 
 # ── 模型檔案（下載後產生，體積大）──────────────────────
 ov_models/qwen3_asr_int8/
+ov_models/qwen3_asr_1p7b_int8/
+ov_models/qwen3_asr_1p7b_kv/
+ov_models/qwen3_asr_1p7b_kv_int8/
+ov_models/qwen3_asr_1p7b_kv_int8_openvino_Scripts/
 ov_models/silero_vad*.onnx
 onnx_models/
 GPUModel/

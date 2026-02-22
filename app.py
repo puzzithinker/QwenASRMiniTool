@@ -64,7 +64,7 @@ RT_MAX_BUFFER_CHUNKS = 600  # ~19s 上限強制轉錄
 # 共用工具函式
 # ══════════════════════════════════════════════════════
 
-def _detect_speech_groups(audio: np.ndarray, vad_sess) -> list[tuple[float, float, np.ndarray]]:
+def _detect_speech_groups(audio: np.ndarray, vad_sess, max_group_sec: int = MAX_GROUP_SEC) -> list[tuple[float, float, np.ndarray]]:
     """Silero VAD 分段，回傳 [(start_s, end_s, chunk), ...]"""
     h  = np.zeros((2, 1, 64), dtype=np.float32)
     c  = np.zeros((2, 1, 64), dtype=np.float32)
@@ -100,7 +100,7 @@ def _detect_speech_groups(audio: np.ndarray, vad_sess) -> list[tuple[float, floa
         else:
             merged.append([s, e])
 
-    mx_samp = MAX_GROUP_SEC * SAMPLE_RATE
+    mx_samp = max_group_sec * SAMPLE_RATE
     groups: list[tuple[int, int]] = []
     gs = merged[0][0] * VAD_CHUNK
     ge = merged[0][1] * VAD_CHUNK
@@ -170,6 +170,8 @@ def _assign_ts(lines: list[str], g0: float, g1: float) -> list[tuple[float, floa
 
 class ASREngine:
     """封裝所有模型。transcribe() 加互斥鎖，多執行緒安全。"""
+
+    max_chunk_secs: int = 30   # 每段最長音訊（秒），子類別可覆寫
 
     def __init__(self):
         self.ready       = False
@@ -283,6 +285,33 @@ class ASREngine:
                 raw = raw.split("<asr_text>", 1)[1]
             return self.cc.convert(raw.strip())
 
+    def _enforce_chunk_limit(
+        self,
+        groups: list[tuple[float, float, np.ndarray, "str | None"]],
+    ) -> list[tuple[float, float, np.ndarray, "str | None"]]:
+        """將超過 max_chunk_secs 的音訊段落切分為等長子片段。
+
+        不論是說話者分離路徑或 VAD 單段路徑，都可能產生比模型
+        輸入長度（max_chunk_secs）更長的 chunk。若不切分，
+        _extract_mel() 會靜默截斷尾段，造成掉字。
+        """
+        max_samples = self.max_chunk_secs * SAMPLE_RATE
+        result = []
+        for t0, t1, chunk, spk in groups:
+            if len(chunk) <= max_samples:
+                result.append((t0, t1, chunk, spk))
+            else:
+                pos = 0
+                while pos < len(chunk):
+                    piece = chunk[pos: pos + max_samples]
+                    if len(piece) < SAMPLE_RATE:   # 不足 1 秒的殘餘片段跳過
+                        break
+                    piece_t0 = t0 + pos / SAMPLE_RATE
+                    piece_t1 = min(t1, piece_t0 + len(piece) / SAMPLE_RATE)
+                    result.append((piece_t0, piece_t1, piece, spk))
+                    pos += max_samples
+        return result
+
     def process_file(
         self,
         audio_path: Path,
@@ -315,10 +344,13 @@ class ASREngine:
                 for t0, t1, spk in diar_segs
             ]
         else:
-            vad_groups = _detect_speech_groups(audio, self.vad_sess)
+            vad_groups = _detect_speech_groups(audio, self.vad_sess, self.max_chunk_secs)
             if not vad_groups:
                 return None
             groups_spk = [(g0, g1, chunk, None) for g0, g1, chunk in vad_groups]
+
+        # 強制切分超過 max_chunk_secs 的片段（兩條路徑都需要）
+        groups_spk = self._enforce_chunk_limit(groups_spk)
 
         # ── ASR 逐段轉錄 ─────────────────────────────────────────────
         all_subs: list[tuple[float, float, str, str | None]] = []
@@ -328,7 +360,8 @@ class ASREngine:
                 spk_info = f" [{spk}]" if spk else ""
                 progress_cb(i, total,
                             f"[{i+1}/{total}] {g0:.1f}s~{g1:.1f}s{spk_info}")
-            text = self.transcribe(chunk, language=language, context=context)
+            max_tok = 400 if language == "Japanese" else 300
+            text = self.transcribe(chunk, max_tokens=max_tok, language=language, context=context)
             if not text:
                 continue
             lines = _split_to_lines(text)
@@ -348,6 +381,145 @@ class ASREngine:
                 prefix = f"{spk}：" if spk else ""
                 f.write(f"{idx}\n{_srt_ts(s)} --> {_srt_ts(e)}\n{prefix}{line}\n\n")
         return out
+
+
+# ══════════════════════════════════════════════════════
+# ASR 引擎 — 1.7B INT8 KV-cache 版本
+# ══════════════════════════════════════════════════════
+
+class ASREngine1p7B(ASREngine):
+    """
+    Qwen3-ASR-1.7B OpenVINO KV-cache 引擎。
+
+    模型目錄：ov_models/qwen3_asr_1p7b_kv_int8/
+      audio_encoder_model.xml       — mel(128,1000)  → audio_embeds(1,130,2048)
+      thinker_embeddings_model.xml  — input_ids      → token_embeds
+      decoder_prefill_kv_model.xml  — prefill pass   → logit + past_keys + past_vals
+      decoder_kv_model.xml          — decode step    → logit + new_keys  + new_vals
+    """
+
+    _OV_SUBDIR     = "qwen3_asr_1p7b_kv_int8"
+    max_chunk_secs = 10   # audio_encoder 匯出固定 T=1000（10s）
+
+    def __init__(self):
+        super().__init__()
+        self.pf_model = None   # compiled prefill model
+        self.dc_model = None   # compiled decode-step model
+
+    def load(self, device: str = "CPU", model_dir: Path = None, cb=None):
+        import onnxruntime as ort
+        import openvino as ov
+        import opencc
+        from processor_numpy import LightProcessor
+
+        if model_dir is None:
+            model_dir = _DEFAULT_MODEL_DIR
+        kv_dir   = model_dir / self._OV_SUBDIR
+        vad_path = model_dir / "silero_vad_v4.onnx"
+
+        def _s(msg):
+            if cb: cb(msg)
+
+        _s("載入 VAD 模型…")
+        self.vad_sess = ort.InferenceSession(
+            str(vad_path), providers=["CPUExecutionProvider"]
+        )
+
+        _s("載入說話者分離模型…")
+        try:
+            from diarize import DiarizationEngine
+            diar_dir = model_dir / "diarization"
+            eng = DiarizationEngine(diar_dir)
+            self.diar_engine = eng if eng.ready else None
+        except Exception:
+            self.diar_engine = None
+
+        _s(f"編譯 1.7B ASR 模型（{device}）…")
+        core = ov.Core()
+        self.audio_enc = core.compile_model(str(kv_dir / "audio_encoder_model.xml"),      device)
+        self.embedder  = core.compile_model(str(kv_dir / "thinker_embeddings_model.xml"), device)
+        self.pf_model  = core.compile_model(str(kv_dir / "decoder_prefill_kv_model.xml"), device)
+        self.dc_model  = core.compile_model(str(kv_dir / "decoder_kv_model.xml"),         device)
+        self.dec_req   = None   # 1.7B 不使用 stateful decoder
+
+        _s("載入 Processor（純 numpy，1.7B 10s）…")
+        self.processor = LightProcessor(kv_dir)
+        self.pad_id    = self.processor.pad_id
+        self.cc        = opencc.OpenCC("s2twp")
+        self.ready     = True
+        _s(f"1.7B 編譯完成（{device}）")
+
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        max_tokens: int = 256,
+        language: str | None = None,
+        context: str | None = None,
+    ) -> str:
+        """KV-cache 貪婪解碼：O(L²) prefill + O(n) decode。"""
+        with self._lock:
+            # 1. 前處理（10s 音訊）
+            mel, ids = self.processor.prepare(audio, language=language, context=context)
+            # audio_encoder 輸入 mel[0] 去除 batch dim → (128, 1000)
+            ae = list(self.audio_enc({"mel": mel[0]}).values())[0]   # (1, 130, 2048)
+            te = list(self.embedder({"input_ids": ids}).values())[0]  # (1, L, 2048)
+
+            # 2. 合併音頻特徵
+            combined = te.copy()
+            mask = ids[0] == self.pad_id
+            n_pad = int(mask.sum()); n_ae = ae.shape[1]
+            if n_pad != n_ae:
+                mn = min(n_pad, n_ae)
+                combined[0, np.where(mask)[0][:mn]] = ae[0, :mn]
+            else:
+                combined[0, mask] = ae[0]
+
+            # 3. Prefill
+            seq_len = combined.shape[1]
+            pos_ids = np.arange(seq_len, dtype=np.int64)[np.newaxis, :]
+            pf_out  = self.pf_model({"input_embeds": combined, "position_ids": pos_ids})
+            pf_vals = list(pf_out.values())
+            logits  = pf_vals[0]   # (1, 1, vocab)
+            past_k  = pf_vals[1]   # (28, 1, 8, L, 128)
+            past_v  = pf_vals[2]
+
+            eos = self.processor.eos_id
+            eot = self.processor.eot_id
+            next_tok = int(np.argmax(logits[0, -1, :]))
+            if next_tok in (eos, eot):
+                return ""
+
+            gen     = [next_tok]
+            cur_pos = seq_len
+
+            # 4. Decode loop
+            for _ in range(max_tokens - 1):
+                new_ids = np.array([[next_tok]], dtype=np.int64)
+                new_emb = list(self.embedder({"input_ids": new_ids}).values())[0]
+                new_pos = np.array([[cur_pos]], dtype=np.int64)
+
+                dc_out  = self.dc_model({
+                    "new_embed":   new_emb,
+                    "new_pos":     new_pos,
+                    "past_keys":   past_k,
+                    "past_values": past_v,
+                })
+                dc_vals  = list(dc_out.values())
+                logits   = dc_vals[0]
+                past_k   = dc_vals[1]
+                past_v   = dc_vals[2]
+
+                next_tok = int(np.argmax(logits[0, -1, :]))
+                if next_tok in (eos, eot):
+                    break
+                gen.append(next_tok)
+                cur_pos += 1
+
+            # 5. 解碼
+            raw = self.processor.decode(gen)
+            if "<asr_text>" in raw:
+                raw = raw.split("<asr_text>", 1)[1]
+            return self.cc.convert(raw.strip())
 
 
 # ══════════════════════════════════════════════════════
@@ -425,12 +597,15 @@ class RealtimeManager:
                 buf.append(chunk); sil = 0
             elif buf:
                 buf.append(chunk); sil += 1
-                if sil >= RT_SILENCE_CHUNKS or len(buf) >= RT_MAX_BUFFER_CHUNKS:
+                rt_max_buf = int(getattr(self.asr, "max_chunk_secs", 19) * SAMPLE_RATE / VAD_CHUNK)
+                if sil >= RT_SILENCE_CHUNKS or len(buf) >= rt_max_buf:
                     audio = np.concatenate(buf)
                     n = max(1, len(audio) // SAMPLE_RATE) * SAMPLE_RATE
+                    _max_tok = 400 if self.language == "Japanese" else 300
                     try:
                         text = self.asr.transcribe(
                             audio[:n],
+                            max_tokens=_max_tok,
                             language=self.language,
                             context=self.context,
                         )
@@ -500,8 +675,20 @@ class App(ctk.CTk):
         dev_bar.pack(fill="x", padx=10, pady=(6, 0))
         dev_bar.pack_propagate(False)
 
-        ctk.CTkLabel(dev_bar, text="推理裝置：", font=FONT_BODY).pack(
+        ctk.CTkLabel(dev_bar, text="模型：", font=FONT_BODY).pack(
             side="left", padx=(14, 4), pady=12
+        )
+        self.model_var   = ctk.StringVar(value="Qwen3-ASR-0.6B")
+        self.model_combo = ctk.CTkComboBox(
+            dev_bar,
+            values=["Qwen3-ASR-0.6B", "Qwen3-ASR-1.7B INT8"],
+            variable=self.model_var,
+            width=160, state="readonly", font=FONT_BODY,
+        )
+        self.model_combo.pack(side="left", pady=12)
+
+        ctk.CTkLabel(dev_bar, text="推理裝置：", font=FONT_BODY).pack(
+            side="left", padx=(12, 4), pady=12
         )
         self.device_var   = ctk.StringVar(value="CPU")
         self.device_combo = ctk.CTkComboBox(
@@ -822,6 +1009,13 @@ class App(ctk.CTk):
             target.delete(0, "end")
             target.insert(0, text)
 
+    def _refresh_model_combo(self, model_dir: Path):
+        """主執行緒：固定顯示所有模型選項（下載邏輯由 _load_models 處理）。"""
+        available = ["Qwen3-ASR-0.6B", "Qwen3-ASR-1.7B INT8"]
+        self.model_combo.configure(values=available)
+        if self.model_var.get() not in available:
+            self.model_var.set(available[0])
+
     def _detect_ov_devices(self):
         """
         固定使用 CPU。
@@ -870,13 +1064,16 @@ class App(ctk.CTk):
     # ── 啟動檢查：模型完整性 → 必要時下載 → 載入模型 ─────────────────
 
     def _startup_check(self):
-        """背景執行緒：確認模型路徑 → 下載（若需要）→ 載入。"""
-        from downloader import quick_check, download_all
+        """背景執行緒：確認模型路徑 → 下載（按使用者選擇）→ 載入。"""
+        from downloader import (quick_check, download_all,
+                                quick_check_1p7b, download_1p7b,
+                                quick_check_diarization, download_diarization)
 
-        # 1. 解析模型路徑
+        # 1. 解析模型路徑；若找不到，顯示路徑 + 模型選擇對話框
+        download_sel = {"0.6B": True, "1.7B": False, "diar": False}
         model_dir = self._resolve_model_dir()
         if model_dir is None:
-            chosen = [None]
+            chosen = [None, None]   # [path, download_sel_dict]
             evt = threading.Event()
             self.after(0, lambda: self._show_model_path_dialog(chosen, evt))
             evt.wait()
@@ -884,14 +1081,16 @@ class App(ctk.CTk):
                 self.after(0, lambda: self._set_status("⚠ 已取消，模型未載入"))
                 return
             model_dir = chosen[0]
+            if chosen[1] is not None:
+                download_sel = chosen[1]
             self._save_settings(model_dir)
 
         self._model_dir = model_dir
 
-        # 2. 下載缺少的模型
+        # 2. 下載 0.6B 基礎模型（必要）
         if not quick_check(model_dir):
             self.after(0, self._show_dl_bar)
-            self._set_status("⬇ 下載模型中…")
+            self._set_status("⬇ 下載 0.6B 模型中…")
             try:
                 download_all(model_dir, progress_cb=self._on_dl_progress)
             except Exception as e:
@@ -906,12 +1105,52 @@ class App(ctk.CTk):
                 return
             self.after(0, self._hide_dl_bar)
 
-        # 3. 載入模型
+        # 3. 下載 1.7B 模型（若使用者在對話框勾選）
+        if download_sel.get("1.7B") and not quick_check_1p7b(model_dir):
+            self.after(0, self._show_dl_bar)
+            self._set_status("⬇ 下載 1.7B 模型（約 4.3 GB）…")
+            try:
+                download_1p7b(model_dir, progress_cb=self._on_dl_progress)
+                self.after(0, self._hide_dl_bar)
+            except Exception as e:
+                msg = str(e)
+                self.after(0, self._hide_dl_bar)
+                self.after(0, lambda: messagebox.showwarning(
+                    "1.7B 下載警告",
+                    f"1.7B 模型下載失敗：\n{msg}\n\n"
+                    "稍後可在下拉選單選擇 1.7B 後點「重新載入」重試。",
+                ))
+
+        # 4. 下載說話者分離模型（若使用者在對話框勾選）
+        if download_sel.get("diar") and not quick_check_diarization(model_dir):
+            self.after(0, self._show_dl_bar)
+            self._set_status("⬇ 下載說話者分離模型…")
+            try:
+                download_diarization(
+                    model_dir / "diarization",
+                    progress_cb=self._on_dl_progress,
+                )
+                self.after(0, self._hide_dl_bar)
+            except Exception as e:
+                msg = str(e)
+                self.after(0, self._hide_dl_bar)
+                self.after(0, lambda: messagebox.showwarning(
+                    "說話者分離下載警告",
+                    f"說話者分離模型下載失敗：\n{msg}\n\n"
+                    "稍後可透過「重新載入」重試。",
+                ))
+
+        # 更新模型選單（固定顯示全部選項）
+        self.after(0, lambda d=model_dir: self._refresh_model_combo(d))
+
+        # 5. 載入模型
         self._set_status("⏳ 模型載入中…")
         self._load_models()
 
     def _show_model_path_dialog(self, chosen: list, evt: threading.Event):
-        """主執行緒：顯示模型路徑選擇對話框。"""
+        """主執行緒：顯示模型路徑 + 下載選項對話框。
+        chosen[0] = 選定路徑（Path），chosen[1] = 下載選項 dict。
+        """
         dlg = ctk.CTkToplevel(self)
         dlg.title("選擇模型存放路徑")
         dlg.resizable(False, False)
@@ -919,17 +1158,17 @@ class App(ctk.CTk):
         dlg.focus_set()
 
         self.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width()  - 480) // 2
-        y = self.winfo_y() + (self.winfo_height() - 230) // 2
-        dlg.geometry(f"480x230+{x}+{y}")
+        x = self.winfo_x() + (self.winfo_width()  - 500) // 2
+        y = self.winfo_y() + (self.winfo_height() - 380) // 2
+        dlg.geometry(f"500x380+{x}+{y}")
 
         ctk.CTkLabel(
             dlg,
-            text="找不到 Qwen3 ASR 模型\n請選擇模型的存放資料夾（首次將自動下載，約 1.2 GB）",
+            text="找不到 Qwen3 ASR 模型\n請選擇模型存放資料夾，並勾選要下載的模型",
             justify="left",
         ).pack(anchor="w", padx=20, pady=(18, 8))
 
-        # 優先顯示上次記住的路徑，否則預設
+        # ── 路徑選擇 ──────────────────────────────────────────────────
         _saved = self._load_settings().get("model_dir")
         path_var = ctk.StringVar(value=_saved if _saved else str(_DEFAULT_MODEL_DIR))
 
@@ -951,23 +1190,59 @@ class App(ctk.CTk):
             text="若所選資料夾已有模型檔案，將直接使用，不會重複下載。",
             font=ctk.CTkFont(size=11),
             text_color="gray",
-        ).pack(anchor="w", padx=20, pady=(6, 0))
+        ).pack(anchor="w", padx=20, pady=(4, 0))
 
+        # ── 模型選擇 ──────────────────────────────────────────────────
+        ctk.CTkLabel(
+            dlg, text="選擇要下載的模型：",
+            font=FONT_BODY, anchor="w",
+        ).pack(anchor="w", padx=20, pady=(16, 4))
+
+        var_06b  = ctk.BooleanVar(value=True)
+        var_17b  = ctk.BooleanVar(value=False)
+        var_diar = ctk.BooleanVar(value=False)
+
+        chk_frame = ctk.CTkFrame(dlg, fg_color="transparent")
+        chk_frame.pack(fill="x", padx=32)
+
+        ctk.CTkCheckBox(
+            chk_frame,
+            text="Qwen3-ASR-0.6B         基礎語音辨識（必要，~1.2 GB）",
+            variable=var_06b, state="disabled", font=FONT_BODY,
+        ).pack(anchor="w", pady=4)
+        ctk.CTkCheckBox(
+            chk_frame,
+            text="Qwen3-ASR-1.7B INT8  高精度語音辨識（~4.3 GB）",
+            variable=var_17b, font=FONT_BODY,
+        ).pack(anchor="w", pady=4)
+        ctk.CTkCheckBox(
+            chk_frame,
+            text="說話者分離                   識別不同說話者（~32 MB）",
+            variable=var_diar, font=FONT_BODY,
+        ).pack(anchor="w", pady=4)
+
+        # ── 按鈕 ──────────────────────────────────────────────────────
         btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
-        btn_row.pack(pady=(14, 0))
+        btn_row.pack(pady=(18, 0))
 
         def _confirm():
             val = path_var.get().strip()
             chosen[0] = Path(val) if val else None
+            chosen[1] = {
+                "0.6B": True,           # 0.6B 永遠下載
+                "1.7B": var_17b.get(),
+                "diar": var_diar.get(),
+            }
             dlg.destroy()
             evt.set()
 
         def _cancel():
             chosen[0] = None
+            chosen[1] = None
             dlg.destroy()
             evt.set()
 
-        ctk.CTkButton(btn_row, text="確認並繼續", width=120, command=_confirm).pack(side="left", padx=8)
+        ctk.CTkButton(btn_row, text="確認並開始下載", width=130, command=_confirm).pack(side="left", padx=8)
         ctk.CTkButton(btn_row, text="取消", width=80, fg_color="#555", command=_cancel).pack(side="left", padx=8)
         dlg.protocol("WM_DELETE_WINDOW", _cancel)
 
@@ -982,7 +1257,45 @@ class App(ctk.CTk):
         self.dl_bar.pack_forget()
 
     def _load_models(self):
-        device = self.device_var.get()
+        import gc
+        device    = self.device_var.get()
+        model_sel = self.model_var.get()
+        # 主動釋放舊引擎佔用的記憶體（OV 編譯模型可能達 3+ GB）
+        self.engine.audio_enc  = None
+        self.engine.embedder   = None
+        self.engine.dec_req    = None
+        if hasattr(self.engine, "pf_model"):
+            self.engine.pf_model = None
+            self.engine.dc_model = None
+        self.engine.vad_sess   = None
+        gc.collect()
+
+        # ── 1.7B 按需下載 ──────────────────────────────────────────────
+        if "1.7B" in model_sel and self._model_dir:
+            from downloader import quick_check_1p7b, download_1p7b
+            if not quick_check_1p7b(self._model_dir):
+                self.after(0, self._show_dl_bar)
+                self._set_status("⬇ 下載 1.7B 模型（約 4.3 GB）…")
+                try:
+                    download_1p7b(self._model_dir, progress_cb=self._on_dl_progress)
+                except Exception as e:
+                    msg = str(e)
+                    self.after(0, self._hide_dl_bar)
+                    self.after(0, lambda: self.reload_btn.configure(state="normal"))
+                    self.after(0, lambda: messagebox.showerror(
+                        "下載失敗",
+                        f"1.7B 模型下載失敗：\n{msg}\n\n"
+                        "請確認網路連線後點「重新載入」重試。",
+                    ))
+                    self.after(0, lambda: self._set_status("❌ 下載失敗"))
+                    return
+                self.after(0, self._hide_dl_bar)
+
+        # 根據選擇的模型建立對應引擎
+        if "1.7B" in model_sel:
+            self.engine = ASREngine1p7B()
+        else:
+            self.engine = ASREngine()
         try:
             self.engine.load(device=device, model_dir=self._model_dir, cb=self._set_status)
             self.after(0, self._on_models_ready)

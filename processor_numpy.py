@@ -199,10 +199,10 @@ class LightProcessor:
         self._model_dir = model_dir
 
         # ── 讀取 prompt template ──────────────────────────────────────
-        # 搜尋順序：BASE_DIR → OV_DIR → 本檔案同層（PyInstaller _internal/）
-        tpl_path = model_dir.parent.parent / "prompt_template.json"
+        # 搜尋順序：OV_DIR（模型特定設定優先）→ BASE_DIR → 本檔案同層
+        tpl_path = model_dir / "prompt_template.json"
         if not tpl_path.exists():
-            tpl_path = model_dir / "prompt_template.json"
+            tpl_path = model_dir.parent.parent / "prompt_template.json"
         if not tpl_path.exists():
             tpl_path = Path(__file__).parent / "prompt_template.json"
         with open(tpl_path, "r", encoding="utf-8") as f:
@@ -215,6 +215,9 @@ class LightProcessor:
         self.eos_id:      int        = tpl["eos_id"]
         self.eot_id:      int        = tpl["eot_id"]
         self._special_ids: set[int]  = set(tpl["special_ids"])
+        # Mel 長度：從 template 讀取，允許各模型不同（0.6B: 480000/3000，1.7B: 160000/1000）
+        self._n_samples: int = tpl.get("n_samples", _N_SAMPLES)
+        self._nb_frames: int = tpl.get("nb_frames", _NB_FRAMES)
 
         # ── 語系相關（供 UI 顯示與強制語系功能）──────────────────────
         self._language_suffix_ids: dict[str, list[int]] = tpl.get("language_suffix_ids", {})
@@ -278,6 +281,31 @@ class LightProcessor:
         """將任意文字 BPE encode 為 token IDs（用於 hint/context）。"""
         return self._get_bpe_tokenizer().encode(text).ids
 
+    # ── Mel 特徵提取（per-instance，使用自身 n_samples / nb_frames）────
+
+    def _extract_mel(self, audio: np.ndarray) -> np.ndarray:
+        """輸出 [1, 128, nb_frames] float32 mel，長度由 prompt_template 決定。"""
+        audio = audio.astype(np.float32)
+        if len(audio) > self._n_samples:
+            audio = audio[:self._n_samples]
+        if len(audio) < self._n_samples:
+            audio = np.pad(audio, (0, self._n_samples - len(audio)))
+
+        half = _N_FFT // 2
+        audio_c = np.pad(audio, half, mode="reflect")
+        frames = np.lib.stride_tricks.sliding_window_view(audio_c, _N_FFT)[::_HOP]
+        frames = frames[:self._nb_frames].astype(np.float32)
+        windowed = frames * _HANN_WINDOW
+
+        stft  = np.fft.rfft(windowed, axis=1)
+        power = np.abs(stft).astype(np.float32) ** 2
+        mel   = (_load_mel_filters(self._model_dir) @ power.T)
+
+        log_mel = np.log10(np.maximum(mel, 1e-10))
+        log_mel = np.maximum(log_mel, log_mel.max() - 8.0)
+        log_mel = (log_mel + 4.0) / 4.0
+        return log_mel[np.newaxis, :, :].astype(np.float32)   # (1, 128, nb_frames)
+
     # ── 外部 API ──────────────────────────────────────────────────────
 
     def prepare(
@@ -295,7 +323,7 @@ class LightProcessor:
             mel       : [1, 128, 3000] float32
             input_ids : [1, L]         int64
         """
-        mel = extract_mel(audio)
+        mel = self._extract_mel(audio)
 
         # ── 組裝 prefix（含 context/hint）────────────────────────────
         if context and context.strip():

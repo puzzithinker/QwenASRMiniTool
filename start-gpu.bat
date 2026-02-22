@@ -13,7 +13,12 @@ set "GPU_MODEL_DIR=%SCRIPT_DIR%GPUModel"
 set "ASR_MODEL_DIR=%GPU_MODEL_DIR%\Qwen3-ASR-1.7B"
 set "VENV_DIR=%SCRIPT_DIR%venv-gpu"
 set "APP_SCRIPT=%SCRIPT_DIR%app-gpu.py"
+set "SL_SCRIPT=%SCRIPT_DIR%streamlit_app.py"
 set "PYTHON_EXE=python"
+
+REM ---- Clean up leftover temp files from previous runs -------
+if exist "%SCRIPT_DIR%__sl_run__.bat" del "%SCRIPT_DIR%__sl_run__.bat" 2>nul
+if exist "%SCRIPT_DIR%.tmp_ip"        del "%SCRIPT_DIR%.tmp_ip"        2>nul
 
 
 REM ---- Check Python ------------------------------------------
@@ -28,7 +33,7 @@ for /f "tokens=2 delims= " %%v in ('python --version 2^>^&1') do set PY_VER=%%v
 echo  [OK] Python %PY_VER% found.
 echo.
 
-REM ---- Choose environment ------------------------------------
+REM ---- Step 1/3: Choose environment --------------------------
 echo  Step 1/3: Python Environment
 echo  --------------------------------------------------------
 echo   [1] Use system Python (recommended if torch+CUDA already installed)
@@ -151,7 +156,7 @@ if "!INST_CHOICE!"=="1" (
 :pkg_check_done
 echo.
 
-REM ---- Check / download GPU models ---------------------------
+REM ---- Step 2/3: Check / download GPU models -----------------
 echo  Step 2/3: GPU Models
 echo  --------------------------------------------------------
 if exist "%ASR_MODEL_DIR%\config.json" (
@@ -220,11 +225,25 @@ if not exist "%GPU_MODEL_DIR%\silero_vad_v4.onnx" (
 echo.
 
 REM ---- GPU check ---------------------------------------------
-echo  Step 3/3: Launch
-echo  --------------------------------------------------------
 "%PYTHON_EXE%" -c "import torch; avail=torch.cuda.is_available(); print('[OK] CUDA:', torch.cuda.get_device_name(0)) if avail else print('[WARN] CUDA not available - CPU mode')"
 
-REM ---- Get local LAN IP (connect-trick, write to tmp file) ---
+REM ---- Step 3/3: Choose interface ----------------------------
+echo.
+echo  Step 3/3: Choose Interface
+echo  --------------------------------------------------------
+echo   [1] Streamlit web frontend   (LAN service, http://0.0.0.0:8501)
+echo   [2] CustomTkinter desktop    (local app only)
+echo.
+set /p UI_CHOICE=" Select [1/2, default=1]: "
+if "!UI_CHOICE!"=="" set UI_CHOICE=1
+
+if "!UI_CHOICE!"=="2" goto :launch_ctk
+goto :launch_streamlit
+
+REM ---- Launch Streamlit (foreground) -------------------------
+:launch_streamlit
+echo.
+REM Get LAN IP
 "%PYTHON_EXE%" -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(0); s.connect(('8.8.8.8',80)); open('%SCRIPT_DIR%.tmp_ip','w').write(s.getsockname()[0]); s.close()" 2>nul
 set LOCAL_IP=localhost
 if exist "%SCRIPT_DIR%.tmp_ip" (
@@ -232,23 +251,11 @@ if exist "%SCRIPT_DIR%.tmp_ip" (
     del "%SCRIPT_DIR%.tmp_ip" 2>nul
 )
 
-REM ---- Write Streamlit launcher helper bat -------------------
-REM     (avoids nested-quote hell in the start command)
-set "SL_HELPER=%SCRIPT_DIR%__sl_run__.bat"
-echo @echo off                                                 > "%SL_HELPER%"
-echo chcp 65001 ^> nul                                        >> "%SL_HELPER%"
-echo "%PYTHON_EXE%" -m streamlit run "%SCRIPT_DIR%streamlit_app.py" --server.port 8501 --server.address 0.0.0.0 --browser.gatherUsageStats false --theme.base dark >> "%SL_HELPER%"
-echo pause                                                     >> "%SL_HELPER%"
+if not exist "%SL_SCRIPT%" (
+    echo  [ERROR] streamlit_app.py not found: %SL_SCRIPT%
+    pause & exit /b 1
+)
 
-REM ---- Launch Streamlit in a new window ----------------------
-echo.
-echo  [>>] Starting Streamlit web frontend...
-start "Qwen3 ASR - Web Frontend" cmd /k "%SL_HELPER%"
-
-REM Wait for Streamlit to bind the port
-timeout /t 4 /nobreak > nul
-
-echo.
 echo  ============================================================
 echo   Streamlit Web Frontend
 echo  ============================================================
@@ -257,21 +264,32 @@ echo   Local    :  http://127.0.0.1:8501
 echo   Network  :  http://!LOCAL_IP!:8501
 echo.
 echo   Share the Network URL with anyone on the same LAN.
-echo   For a public tunnel, run in another terminal:
-echo     npx localtunnel --port 8501
+echo   Press Ctrl+C to stop the server.
 echo.
 echo  ============================================================
 echo.
+echo  [>>] Starting Streamlit...
+echo.
+"%PYTHON_EXE%" -m streamlit run "%SL_SCRIPT%" --server.port 8501 --server.address 0.0.0.0 --browser.gatherUsageStats false --theme.base dark
+if errorlevel 1 (
+    echo.
+    echo  [!] Streamlit exited with error. See message above.
+    pause
+)
+goto :done
 
-REM ---- Launch desktop app (foreground) -----------------------
+REM ---- Launch CustomTkinter desktop (foreground) -------------
+:launch_ctk
+echo.
 echo  [>>] Starting desktop app (app-gpu.py)...
 echo.
 "%PYTHON_EXE%" "%APP_SCRIPT%"
-
-REM Keep window open if crash
 if errorlevel 1 (
     echo.
     echo  [!] App exited with error. See message above.
     pause
 )
+goto :done
+
+:done
 endlocal

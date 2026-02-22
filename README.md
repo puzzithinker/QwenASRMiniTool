@@ -111,6 +111,46 @@ start-gpu.bat
 
 ---
 
+### Streamlit 前端（0222 更新，僅 GPU 服務版本）
+
+![Streamlit 前端介面](Readme/readme08.jpg)
+
+提供標準 Streamlit 前端，現在可於 GPU 版本啟動時選擇 Streamlit 前端，方便在內網中搭建服務使用，目前預設是使用此前端，選擇 2 可以切換為原來的 Tkinter 前端。
+如果只想使用 Tkinter 前端，可以直接執行 `app-gpu.py`。
+
+![啟動選擇畫面](Readme/readme09.jpg)
+
+Streamlit 前端可從網路端點（例如手機上）使用麥克風，採取按壓錄音方式進行錄製，傳輸到本地端辨識後再停止錄製。
+若在外網需要使用，可利用 CloudFlare Tunnel 或 Ngrok 通道，但須自行注意端口保護。
+
+![手機麥克風使用](Readme/readme10.jpg)
+
+---
+
+### Qwen3-ASR-1.7B-INT8-OpenVINO 支援（Standard 版本 Basic，0222 更新）
+
+![1.7B 模型支援](Readme/readme11.jpg)
+
+大型更新，此模型無法包入 Portable 包中，要使用此模型，目前採自動下載方式。
+當切換成 1.7B，而資料夾沒有這個模型時，就會開啟自動下載。
+
+已經使用 Portable 的使用者，覆蓋升級至 0222 版本時，模型切換步驟為：
+
+1. 下拉選擇「**Qwen3-ASR-1.7B INT8**」
+2. 點選「**重新載入**」，即會自動開始下載並切換
+
+> 注意：沒有點「重新載入」就不會有效果。
+
+**效能實測**：使用 1.7B-INT8，在 8 GB RAM、i5-1135G7 2.4 GHz 筆電（2021 年 8 月出廠），辨識一小時語音約需 1300 秒（約 20 分鐘）。目前尚未開放多線程功能，約使用一半核心數的 CPU 資源。
+
+![效能說明](Readme/readme12.jpg)
+
+0222 的 Basic 版本現在啟動時，若偵測不到模型，可於彈出對話框中直接勾選要下載的模型（0.6B 必選、1.7B 和說話者分離可選），確認後自動依序下載。
+
+![初次啟動下載選項](Readme/readme13.jpg)
+
+---
+
 ## 更版方式
 
 ### Python 版本
@@ -125,7 +165,8 @@ git pull
 
 - **已下載過 Portable 版本的使用者**：不需重新下載 Portable，僅需下載 **Basic 版本**，解壓縮後覆蓋現有資料夾即可。
 - 啟動後程式會自動檢查模型完整性；若為首次使用說話者分離功能，會彈出提示下載說話者分離模型（約 32 MB）。
-- 原有的 `Subtitle` 輸出資料夾內容**不會受到影響**。
+- 原有的 `subtitles` 輸出資料夾內容**不會受到影響**。
+- **使用 1.7B 模型**：覆蓋升級後，在模型下拉選單選擇「Qwen3-ASR-1.7B INT8」，點選「重新載入」即會自動下載（約 4.3 GB），下載完成後自動切換。
 
 ---
 
@@ -147,9 +188,11 @@ git pull
 
 | 項目 | 連結 |
 |------|------|
-| OpenVINO INT8 量化版（主要下載源） | [dseditor/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO](https://huggingface.co/dseditor/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO) |
-| OpenVINO INT8 量化版（備用下載源） | [Echo9Zulu/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO](https://huggingface.co/Echo9Zulu/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO) |
-| 原始 PyTorch 模型 | [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) |
+| 0.6B OpenVINO INT8（主要下載源） | [dseditor/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO](https://huggingface.co/dseditor/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO) |
+| 0.6B OpenVINO INT8（備用下載源） | [Echo9Zulu/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO](https://huggingface.co/Echo9Zulu/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO) |
+| **1.7B OpenVINO INT8 KV-Cache** | [dseditor/Qwen3-ASR-1.7B-INT8_OpenVINO](https://huggingface.co/dseditor/Qwen3-ASR-1.7B-INT8_OpenVINO) |
+| 原始 PyTorch 模型（0.6B） | [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) |
+| 原始 PyTorch 模型（1.7B） | [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) |
 | VAD 模型 | [snakers4/silero-vad v4.0](https://github.com/snakers4/silero-vad) |
 | 說話者分離模型（分段 + 聲紋）| [altunenes/speaker-diarization-community-1-onnx](https://huggingface.co/altunenes/speaker-diarization-community-1-onnx) |
 
@@ -173,17 +216,20 @@ python generate_prompt_template.py
 ### 架構說明
 
 ```
-app.py                  # CustomTkinter GUI 主程式
-downloader.py           # 模型完整性檢查與自動下載（含備援 URL）
+app.py                  # CustomTkinter GUI 主程式（Basic / Portable EXE）
+app-gpu.py              # CustomTkinter GPU 版本（需 NVIDIA GPU + PyTorch CUDA）
+app_streamlit.py        # Streamlit 前端（GPU 服務版，可由 start-gpu.bat 啟動）
+start-gpu.bat           # GPU 版啟動器（配置 venv、下載模型、選擇前端）
+downloader.py           # 模型完整性檢查與自動下載（含 1.7B、說話者分離）
 processor_numpy.py      # 純 numpy Mel / BPE 處理器（不依賴 torch）
 diarize.py              # 說話者分離引擎（兩階段聚類，不依賴 torch）
 generate_prompt_template.py  # 從原始模型提取 prompt 模板
-prompt_template.json    # Chat template token ID（含語系 suffix IDs）
 ov_models/
-  mel_filters.npy       # 預計算 Mel 濾波器
-  silero_vad_v4.onnx    # VAD 靜音偵測模型（執行後下載）
-  qwen3_asr_int8/       # OpenVINO INT8 模型（執行後下載，~1.2 GB）
-  diarization/          # 說話者分離 ONNX 模型（首次使用時下載，~32 MB）
+  mel_filters.npy            # 預計算 Mel 濾波器
+  silero_vad_v4.onnx         # VAD 靜音偵測模型
+  qwen3_asr_int8/            # 0.6B OpenVINO INT8（自動下載，~1.2 GB）
+  qwen3_asr_1p7b_kv_int8/   # 1.7B OpenVINO INT8 KV-Cache（按需下載，~4.3 GB）
+  diarization/               # 說話者分離 ONNX 模型（首次使用時下載，~32 MB）
     segmentation-community-1.onnx
     embedding_model.onnx
 ```

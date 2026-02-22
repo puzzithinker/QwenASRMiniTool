@@ -36,6 +36,30 @@ _HF_BASE  = _HF_BASE_PRIMARY   # 相容舊版引用
 _VAD_URL  = "https://github.com/snakers4/silero-vad/raw/v4.0/files/silero_vad.onnx"
 _UA       = "Mozilla/5.0 (compatible; QwenASR-downloader)"
 
+# ── 1.7B INT8 KV-cache 模型倉庫 ───────────────────────────────────────
+_HF_1P7B_REPO = "dseditor/Qwen3-ASR-1.7B-INT8_OpenVINO"
+_HF_1P7B_BASE = f"https://huggingface.co/{_HF_1P7B_REPO}/resolve/main"
+
+_1P7B_REQUIRED_BIN: list[str] = [
+    "audio_encoder_model.bin",
+    "thinker_embeddings_model.bin",
+    "decoder_prefill_kv_model.bin",
+    "decoder_kv_model.bin",
+]
+_1P7B_REQUIRED_OTHER: list[str] = [
+    "audio_encoder_model.xml",
+    "thinker_embeddings_model.xml",
+    "decoder_prefill_kv_model.xml",
+    "decoder_kv_model.xml",
+    "prompt_template.json",
+    "config.json",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "preprocessor_config.json",
+    "chat_template.json",
+]
+
 # ── 說話者分離模型（直接 URL，非 HF API）──────────────────────────────
 _DIAR_BASE = "https://huggingface.co/altunenes/speaker-diarization-community-1-onnx/resolve/main"
 DIAR_FILES: dict[str, str] = {
@@ -108,6 +132,59 @@ def download_diarization(diar_dir: Path, progress_cb=None):
 
     if progress_cb:
         progress_cb(1.0, "說話者分離模型下載完成！")
+
+
+def quick_check_1p7b(model_dir: Path) -> bool:
+    """快速檢查 1.7B KV-cache INT8 模型是否完整（只檢查存在，不驗證雜湊）。"""
+    kv_dir = model_dir / "qwen3_asr_1p7b_kv_int8"
+    for fname in _1P7B_REQUIRED_BIN + _1P7B_REQUIRED_OTHER:
+        if not (kv_dir / fname).exists():
+            return False
+    return True
+
+
+def download_1p7b(model_dir: Path, progress_cb=None):
+    """
+    從 HuggingFace 下載 1.7B KV-cache INT8 模型至 model_dir/qwen3_asr_1p7b_kv_int8/。
+    progress_cb(pct: float, msg: str)   pct ∈ [0, 1]
+    下載失敗時拋出例外。
+    """
+    kv_dir = model_dir / "qwen3_asr_1p7b_kv_int8"
+    kv_dir.mkdir(parents=True, exist_ok=True)
+
+    all_files = _1P7B_REQUIRED_BIN + _1P7B_REQUIRED_OTHER
+    tasks = [f for f in all_files if not (kv_dir / f).exists()]
+
+    if not tasks:
+        if progress_cb:
+            progress_cb(1.0, "所有 1.7B 檔案已存在")
+        return
+
+    total = len(tasks)
+    for idx, fname in enumerate(tasks):
+        dest     = kv_dir / fname
+        base_pct = idx / total
+        span_pct = 1.0 / total
+
+        if progress_cb:
+            progress_cb(base_pct, f"下載 {fname}…")
+
+        def _file_cb(done: int, total_b: int,
+                     _b=base_pct, _s=span_pct, _f=fname):
+            if progress_cb and total_b > 0:
+                progress_cb(
+                    _b + _s * done / total_b,
+                    f"下載 {_f}…  {done/1_048_576:.1f} / {total_b/1_048_576:.1f} MB",
+                )
+
+        url = f"{_HF_1P7B_BASE}/{fname}"
+        _download_file(url, dest, progress_cb=_file_cb)
+
+        if progress_cb:
+            progress_cb(base_pct + span_pct, f"✅ {fname}")
+
+    if progress_cb:
+        progress_cb(1.0, "1.7B 模型下載完成！")
 
 
 # ══════════════════════════════════════════════════════════════════════
