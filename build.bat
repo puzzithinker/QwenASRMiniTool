@@ -28,8 +28,10 @@ IF EXIST "F:\AIStudio\QwenASR\build_venv\Scripts\python.exe" (
 SET PYTHON=%VENV%\Scripts\python.exe
 SET SRC=F:\AIStudio\QwenASR
 
-echo === Step 1: Install PyInstaller ===
-%PYTHON% -m pip install pyinstaller --quiet
+echo === Step 1: Install PyInstaller + Streamlit ===
+REM streamlit is bundled into _internal/ via --collect-all streamlit
+REM so QwenASR.exe can serve the web UI without a separate Python install.
+%PYTHON% -m pip install pyinstaller streamlit --quiet
 
 echo.
 echo === Step 2: Locate dependency paths ===
@@ -87,6 +89,8 @@ REM Chinese Windows (cp950 default encoding).
     --add-data "%SRC%\ov_models\silero_vad_v4.onnx;ov_models" ^
     --runtime-hook "%SRC%\runtime_hook_utf8.py" ^
     --collect-all tokenizers ^
+    --collect-all streamlit ^
+    --collect-all tornado ^
     --hidden-import openvino ^
     --hidden-import openvino.runtime ^
     --hidden-import onnxruntime ^
@@ -153,23 +157,16 @@ IF EXIST "%SRC%\dist\QwenASR\QwenASR.exe" (
     )
 
     echo.
-    REM Copy streamlit_app.py (needed by the service tab to run Streamlit)
-    xcopy "%SRC%\streamlit_app.py"               "%SRC%\dist\QwenASR\" /Y /Q
-    echo  streamlit_app.py copied to dist\QwenASR\
-
-    REM Copy python.exe + python3*.dll to _python\ subdirectory (NOT the EXE root).
-    REM Reason: placing python3XX.dll in the same dir as QwenASR.exe causes Windows
-    REM DLL loader to load TWO different copies of the Python DLL (one for QwenASR.exe
-    REM via PyInstaller _internal/, one for python.exe via the root dir), which can
-    REM produce undefined behavior and per-chunk window flashes in windowed mode.
-    REM python.exe finds python3XX.dll in its own directory (_python\), which is correct.
-    xcopy "%VENV%\Scripts\python.exe"            "%SRC%\dist\QwenASR\_python\" /Y /Q
-    xcopy "%VENV%\Scripts\python3*.dll"          "%SRC%\dist\QwenASR\_python\" /Y /Q 2>NUL
-    echo  python.exe  copied to dist\QwenASR\_python\  (required for Streamlit service)
+    REM Copy streamlit_vulkan.py (Streamlit web UI script).
+    REM The service is launched by QwenASR.exe --streamlit-mode streamlit_vulkan.py
+    REM using the frozen Python in _internal/ (no separate python.exe needed).
+    xcopy "%SRC%\streamlit_vulkan.py"            "%SRC%\dist\QwenASR\" /Y /Q
+    echo  streamlit_vulkan.py copied to dist\QwenASR\
 
     echo  Launcher : dist\QwenASR\QwenASR.exe
-    echo  Runtime  : dist\QwenASR\_internal\
+    echo  Runtime  : dist\QwenASR\_internal\  (includes streamlit via --collect-all)
     echo  GPU DLLs : dist\QwenASR\chatllm\   (~71 MB, Vulkan backend)
+    echo  WebUI    : dist\QwenASR\streamlit_vulkan.py  (launched by EXE --streamlit-mode)
     echo.
     echo  Model downloaded at first run from:
     echo    https://huggingface.co/dseditor/Collection/resolve/main/qwen3-asr-1.7b.bin
