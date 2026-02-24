@@ -3,13 +3,13 @@ chcp 65001 > nul
 setlocal enabledelayedexpansion
 
 REM ============================================================
-REM   Qwen3 ASR GPU Launcher  (PyTorch version - maintenance mode)
+REM   Qwen3 ASR GPU Launcher  (PyTorch version)
 REM   Uses PyTorch CUDA backend (no OpenVINO required)
 REM   Model: GPUModel\Qwen3-ASR-1.7B
 REM
-REM   NOTE: This PyTorch launcher is in maintenance mode.
-REM         Main GPU support has moved to chatllm_engine.py
-REM         (Vulkan backend) inside QwenASR.exe.
+REM   Step 3 offers two interfaces:
+REM     [1] CustomTkinter desktop app  (app-gpu.py)
+REM     [2] Streamlit web UI           (streamlit_app.py)
 REM ============================================================
 
 set "SCRIPT_DIR=%~dp0"
@@ -17,6 +17,7 @@ set "GPU_MODEL_DIR=%SCRIPT_DIR%GPUModel"
 set "ASR_MODEL_DIR=%GPU_MODEL_DIR%\Qwen3-ASR-1.7B"
 set "VENV_DIR=%SCRIPT_DIR%venv-gpu"
 set "APP_SCRIPT=%SCRIPT_DIR%app-gpu.py"
+set "SL_SCRIPT=%SCRIPT_DIR%streamlit_app.py"
 set "PYTHON_EXE=python"
 
 REM ---- Clean up leftover temp files from previous runs -------
@@ -115,8 +116,9 @@ echo import importlib.util                                                    > 
 echo pkgs=[('qwen_asr','qwen-asr'),('customtkinter','customtkinter'),        >> "%CHK%"
 echo       ('onnxruntime','onnxruntime'),('numpy','numpy'),                  >> "%CHK%"
 echo       ('librosa','librosa'),('sounddevice','sounddevice'),              >> "%CHK%"
+echo       ('soundfile','soundfile'),('tokenizers','tokenizers'),            >> "%CHK%"
 echo       ('opencc','opencc-python-reimplemented'),                         >> "%CHK%"
-echo       ('huggingface_hub','huggingface-hub'),                            >> "%CHK%"
+echo       ('huggingface_hub','huggingface-hub'),('streamlit','streamlit'),  >> "%CHK%"
 echo       ('torch','torch')]                                                 >> "%CHK%"
 echo missing=[p for m,p in pkgs if importlib.util.find_spec(m) is None]     >> "%CHK%"
 echo print(','.join(missing) if missing else 'OK')                           >> "%CHK%"
@@ -186,11 +188,13 @@ echo.
 echo  [>>] Downloading Qwen3-ASR-1.7B...
 echo       This may take a while depending on your connection.
 echo.
+REM NOTE: *.txt exclusion removed to ensure merges.txt (BPE tokenizer) is downloaded.
+REM       merges.txt is required for the PyTorch tokenizer (huggingface_hub snapshot).
 "%PYTHON_EXE%" -c ^
 "from huggingface_hub import snapshot_download; import os; ^
 os.makedirs(r'%GPU_MODEL_DIR%', exist_ok=True); ^
 snapshot_download('Qwen/Qwen3-ASR-1.7B', local_dir=r'%ASR_MODEL_DIR%', ^
-    ignore_patterns=['*.md', '*.txt', 'flax_model*', 'tf_model*']); ^
+    ignore_patterns=['*.md', 'flax_model*', 'tf_model*']); ^
 print('[OK] Qwen3-ASR-1.7B downloaded.')"
 if errorlevel 1 (
     echo  [ERROR] Download failed. Check network connection and try again.
@@ -210,7 +214,7 @@ if not exist "%ALIGNER_DIR%\config.json" (
         "%PYTHON_EXE%" -c ^
 "from huggingface_hub import snapshot_download; ^
 snapshot_download('Qwen/Qwen3-ForcedAligner-0.6B', local_dir=r'%ALIGNER_DIR%', ^
-    ignore_patterns=['*.md', '*.txt', 'flax_model*', 'tf_model*']); ^
+    ignore_patterns=['*.md', 'flax_model*', 'tf_model*']); ^
 print('[OK] ForcedAligner downloaded.')"
     )
 )
@@ -230,13 +234,20 @@ echo.
 REM ---- GPU check ---------------------------------------------
 "%PYTHON_EXE%" -c "import torch; avail=torch.cuda.is_available(); print('[OK] CUDA:', torch.cuda.get_device_name(0)) if avail else print('[WARN] CUDA not available - CPU mode')"
 
-REM ---- Step 3/3: Launch desktop app --------------------------
+REM ---- Step 3/3: Launch interface ----------------------------
 echo.
-echo  Step 3/3: Launch
+echo  Step 3/3: Launch Interface
 echo  --------------------------------------------------------
-echo  [NOTE] Streamlit frontend has been removed from this launcher.
-echo         For Vulkan GPU support (NVIDIA/AMD), use QwenASR.exe instead.
-echo         This launcher starts the PyTorch CustomTkinter desktop app.
+echo   [1] Desktop App  - CustomTkinter GUI  (app-gpu.py)
+echo   [2] Web UI       - Streamlit Browser  (streamlit_app.py, http://localhost:8501)
+echo.
+set /p LAUNCH_CHOICE=" Select [1/2, default=1]: "
+if "!LAUNCH_CHOICE!"=="" set LAUNCH_CHOICE=1
+
+if "!LAUNCH_CHOICE!"=="2" goto :launch_streamlit
+
+REM ---- Launch CustomTkinter desktop app ----------------------
+:launch_ctk
 echo.
 echo  [>>] Starting desktop app (app-gpu.py)...
 echo.
@@ -244,6 +255,41 @@ echo.
 if errorlevel 1 (
     echo.
     echo  [!] App exited with error. See message above.
+    pause
+)
+goto :done
+
+REM ---- Launch Streamlit web UI --------------------------------
+:launch_streamlit
+echo.
+if not exist "%SL_SCRIPT%" (
+    echo  [ERROR] streamlit_app.py not found: %SL_SCRIPT%
+    echo          Please ensure streamlit_app.py is in the same directory.
+    pause & exit /b 1
+)
+
+REM Check if streamlit is installed
+"%PYTHON_EXE%" -c "import streamlit" > nul 2>&1
+if errorlevel 1 (
+    echo  [WARN] streamlit not installed. Installing now...
+    "%PYTHON_EXE%" -m pip install streamlit --quiet
+    if errorlevel 1 (
+        echo  [ERROR] Failed to install streamlit.
+        pause & exit /b 1
+    )
+)
+
+echo  [>>] Starting Streamlit web UI...
+echo       Open browser at: http://localhost:8501
+echo       Press Ctrl+C to stop.
+echo.
+"%PYTHON_EXE%" -m streamlit run "%SL_SCRIPT%" ^
+    --server.port 8501 ^
+    --server.headless false ^
+    --browser.gatherUsageStats false
+if errorlevel 1 (
+    echo.
+    echo  [!] Streamlit exited with error. See message above.
     pause
 )
 goto :done

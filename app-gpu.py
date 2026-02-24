@@ -1,5 +1,5 @@
 """
-Qwen3 ASR 字幕生成器 - GPU 版本（PyTorch 版本，暫停更新）
+Qwen3 ASR 字幕生成器 - GPU 版本（PyTorch 版本）
 
 推理後端：PyTorch (CUDA / CPU)，使用 Qwen3-ASR-1.7B
 模型路徑：GPUModel/Qwen3-ASR-1.7B
@@ -7,12 +7,13 @@ Qwen3 ASR 字幕生成器 - GPU 版本（PyTorch 版本，暫停更新）
 
 此檔案不納入 EXE 構建，供有 NVIDIA GPU 的使用者以
 系統 Python 或獨立虛擬環境執行。
-啟動方式：start-gpu.bat
+啟動方式：start-gpu.bat（選 [1] CustomTkinter 桌面應用）
 
-NOTE: 此 PyTorch GPU 版本目前暫停更新，僅供保留舊版參考。
-      主要 GPU 支援已改為 chatllm_engine.py（Vulkan 後端），
-      可於 app.py 的 EXE 版本中使用，無須 PyTorch 環境。
-      若有需要再行維護此 PyTorch 版本。
+功能：
+  - 音檔轉字幕（支援影片 mp4/mkv 等，需要 ffmpeg）
+  - 即時轉換（VAD 語音偵測）
+  - 字幕驗證編輯器（來自 subtitle_editor.py）
+  - 批次多檔辨識（來自 batch_tab.py）
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 import threading
 import queue
@@ -40,6 +42,14 @@ from tkinter import filedialog, messagebox
 
 import numpy as np
 import customtkinter as ctk
+
+# ── 共用模組（字幕驗證編輯器）────────────────────────────────────────
+try:
+    from subtitle_editor import SubtitleEditorWindow
+    _SUBTITLE_EDITOR_AVAILABLE = True
+except ImportError:
+    _SUBTITLE_EDITOR_AVAILABLE = False
+    SubtitleEditorWindow = None
 
 # ── 路徑 ──────────────────────────────────────────────
 BASE_DIR        = Path(__file__).parent
@@ -187,6 +197,9 @@ def _find_vad_model() -> Path | None:
     return None
 
 
+# 全域：是否輸出簡體中文（True = 跳過 OpenCC 繁化）
+_g_output_simplified: bool = False
+
 # ══════════════════════════════════════════════════════
 # GPU ASR 引擎
 # ══════════════════════════════════════════════════════
@@ -277,8 +290,8 @@ class GPUASREngine:
                 language=language,
                 context=context or "",
             )
-            text = results[0].text if results else ""
-            return self.cc.convert(text.strip())
+            text = (results[0].text if results else "").strip()
+            return text if _g_output_simplified else self.cc.convert(text)
 
     def process_file(
         self,
@@ -358,9 +371,12 @@ class RealtimeManager:
     def start(self):
         import sounddevice as sd
         self._running = True
+        # 查詢裝置原生聲道數：立體聲混音等 loopback 裝置需要 2ch
+        dev_info        = sd.query_devices(self.dev_idx, "input")
+        self._native_ch = max(1, int(dev_info["max_input_channels"]))
         self._stream  = sd.InputStream(
             device=self.dev_idx, samplerate=SAMPLE_RATE,
-            channels=1, blocksize=VAD_CHUNK, dtype="float32",
+            channels=self._native_ch, blocksize=VAD_CHUNK, dtype="float32",
             callback=self._audio_cb,
         )
         threading.Thread(target=self._loop, daemon=True).start()
@@ -374,7 +390,9 @@ class RealtimeManager:
         self.on_status("⏹ 已停止")
 
     def _audio_cb(self, indata, frames, time_info, status):
-        self._q.put(indata[:, 0].copy())
+        # 多聲道混音取平均轉 mono（立體聲混音 / WASAPI loopback 2ch）
+        mono = indata.mean(axis=1) if indata.shape[1] > 1 else indata[:, 0]
+        self._q.put(mono.copy())
 
     def _loop(self):
         h   = np.zeros((2, 1, 64), dtype=np.float32)
@@ -446,6 +464,7 @@ class App(ctk.CTk):
         self._file_hint: str | None          = None
         self._file_diarize: bool             = False
         self._file_n_speakers: int | None    = None
+        self._ffmpeg_exe: Path | None        = None  # ffmpeg 路徑（影片處理用）
 
         self._build_ui()
         self._detect_devices()
@@ -506,9 +525,17 @@ class App(ctk.CTk):
         self.tabs.pack(fill="both", expand=True, padx=10, pady=(8, 10))
         self.tabs.add("  音檔轉字幕  ")
         self.tabs.add("  即時轉換  ")
+        self.tabs.add("  批次辨識  ")
+        self.tabs.add("  設定  ")
 
         self._build_file_tab(self.tabs.tab("  音檔轉字幕  "))
         self._build_rt_tab(self.tabs.tab("  即時轉換  "))
+        self._build_batch_tab(self.tabs.tab("  批次辨識  "))
+
+        from setting import SettingsTab
+        self._settings_tab = SettingsTab(
+            self.tabs.tab("  設定  "), self, show_service=False)
+        self._settings_tab.pack(fill="both", expand=True)
 
     # ── 音檔轉字幕 tab ─────────────────────────────────
 
@@ -543,6 +570,14 @@ class App(ctk.CTk):
             command=lambda: os.startfile(str(SRT_DIR)),
         )
         self.open_dir_btn.pack(side="left")
+
+        self.subtitle_btn = ctk.CTkButton(
+            row2, text="📝  字幕驗證", width=110, height=36,
+            font=FONT_BODY, state="disabled",
+            fg_color="#1A2A40", hover_color="#243652",
+            command=self._on_open_subtitle_editor,
+        )
+        self.subtitle_btn.pack(side="left", padx=(8, 0))
 
         self._diarize_var = ctk.BooleanVar(value=False)
         self.diarize_chk = ctk.CTkCheckBox(
@@ -726,8 +761,56 @@ class App(ctk.CTk):
 
     # ── 啟動檢查 ───────────────────────────────────────
 
+    # ── 設定讀寫 ───────────────────────────────────────
+
+    def _load_settings(self) -> dict:
+        try:
+            if SETTINGS_FILE.exists():
+                with open(SETTINGS_FILE, encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_settings(self, settings: dict):
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _patch_setting(self, key: str, value):
+        """讀取現有設定、更新單一 key，再寫回 settings-gpu.json。"""
+        s = self._load_settings()
+        s[key] = value
+        self._save_settings(s)
+
+    def _apply_ui_prefs(self, settings: dict):
+        """主執行緒：根據儲存的偏好設定同步 UI 控件與外觀。"""
+        mode = settings.get("appearance_mode", "dark")
+        ctk.set_appearance_mode(mode)
+        if hasattr(self, "_settings_tab"):
+            self._settings_tab.sync_prefs(settings)
+
+    def _on_chinese_mode_change(self, value: str):
+        """輸出模式切換：繁體（OpenCC）or 簡體（直接輸出）。"""
+        global _g_output_simplified
+        _g_output_simplified = (value == "簡體")
+        self._patch_setting("output_simplified", _g_output_simplified)
+
+    def _on_appearance_change(self, value: str):
+        """主題切換：深色 🌑 or 淺色 ☀。"""
+        mode = "light" if value == "☀" else "dark"
+        ctk.set_appearance_mode(mode)
+        self._patch_setting("appearance_mode", mode)
+
     def _startup_check(self):
-        """背景執行緒：檢查模型存在 → 載入。"""
+        """背景執行緒：套用 UI 偏好 → 檢查模型存在 → 載入。"""
+        settings = self._load_settings()
+        global _g_output_simplified
+        _g_output_simplified = settings.get("output_simplified", False)
+        self.after(0, lambda s=settings: self._apply_ui_prefs(s))
+
         asr_path = GPU_MODEL_DIR / ASR_MODEL_NAME
         if not asr_path.exists():
             self.after(0, lambda: self._show_missing_model_error(asr_path))
@@ -763,6 +846,9 @@ class App(ctk.CTk):
         self._set_status(f"✅ 就緒（{device_label}）")
         if self.engine.diar_engine and self.engine.diar_engine.ready:
             self.diarize_chk.configure(state="normal")
+        # 注入引擎到批次 tab
+        if hasattr(self, "_batch_tab"):
+            self._batch_tab.set_engine(self.engine)
 
     def _on_models_failed(self, device: str, reason: str):
         self.device_combo.configure(state="readonly")
@@ -866,9 +952,15 @@ class App(ctk.CTk):
 
     def _on_browse(self):
         path = filedialog.askopenfilename(
-            title="選擇音訊檔案",
-            filetypes=[("音訊檔案", "*.mp3 *.wav *.flac *.m4a *.ogg *.aac"),
-                       ("所有檔案", "*.*")],
+            title="選擇音訊或影片檔案",
+            filetypes=[
+                ("音訊 / 影片檔案",
+                 "*.mp3 *.wav *.flac *.m4a *.ogg *.aac "
+                 "*.mp4 *.mkv *.avi *.mov *.wmv *.webm *.ts *.m2ts"),
+                ("音訊檔案", "*.mp3 *.wav *.flac *.m4a *.ogg *.aac"),
+                ("影片檔案", "*.mp4 *.mkv *.avi *.mov *.wmv *.webm *.ts *.m2ts"),
+                ("所有檔案", "*.*"),
+            ],
         )
         if path:
             self._audio_file = Path(path)
@@ -895,6 +987,23 @@ class App(ctk.CTk):
         n_spk_sel             = self.n_spk_combo.get()
         self._file_n_speakers = int(n_spk_sel) if n_spk_sel.isdigit() else None
 
+        # 影片檔案需要先確認 ffmpeg
+        try:
+            from ffmpeg_utils import is_video, ensure_ffmpeg
+            if is_video(path):
+                def _on_ffmpeg_ready(ffmpeg_path):
+                    self._ffmpeg_exe = ffmpeg_path
+                    self._do_start_convert()
+                ensure_ffmpeg(self, on_ready=_on_ffmpeg_ready,
+                              on_fail=lambda: None)
+                return
+        except ImportError:
+            pass  # ffmpeg_utils 不存在時忽略
+
+        self._ffmpeg_exe = None
+        self._do_start_convert()
+
+    def _do_start_convert(self):
         self._converting = True
         self.convert_btn.configure(state="disabled", text="轉換中…")
         self.prog_bar.set(0)
@@ -907,6 +1016,7 @@ class App(ctk.CTk):
         context    = self._file_hint
         diarize    = getattr(self, "_file_diarize", False)
         n_speakers = getattr(self, "_file_n_speakers", None)
+        ffmpeg_exe = getattr(self, "_ffmpeg_exe", None)
 
         def prog_cb(done, total, msg):
             pct = done / total if total > 0 else 0
@@ -914,7 +1024,25 @@ class App(ctk.CTk):
             self.after(0, lambda: self.prog_label.configure(text=msg))
             self._file_log(msg)
 
+        tmp_wav: "Path | None" = None
         try:
+            # 影片音軌提取
+            try:
+                from ffmpeg_utils import is_video, extract_audio_to_wav
+                if is_video(path):
+                    if not ffmpeg_exe:
+                        raise RuntimeError("找不到 ffmpeg，無法提取影片音軌。")
+                    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+                    os.close(fd)
+                    tmp_wav = Path(wav_path)
+                    self._file_log(f"🎬 提取音軌中：{path.name}")
+                    extract_audio_to_wav(path, tmp_wav, ffmpeg_exe)
+                    proc_path = tmp_wav
+                else:
+                    proc_path = path
+            except ImportError:
+                proc_path = path
+
             t0        = time.perf_counter()
             lang_info = f"  語系：{language or '自動'}"
             hint_info = (f"  提示：{context[:30]}…" if context and len(context) > 30
@@ -923,7 +1051,7 @@ class App(ctk.CTk):
                          if diarize else "")
             self._file_log(f"開始處理：{path.name}{lang_info}{hint_info}{diar_info}")
             srt = self.engine.process_file(
-                path, progress_cb=prog_cb, language=language,
+                proc_path, progress_cb=prog_cb, language=language,
                 context=context, diarize=diarize, n_speakers=n_speakers,
             )
             elapsed = time.perf_counter() - t0
@@ -935,6 +1063,9 @@ class App(ctk.CTk):
                 self.after(0, lambda: [
                     self.prog_bar.set(1.0),
                     self.open_dir_btn.configure(state="normal"),
+                    self.subtitle_btn.configure(
+                        state="normal" if _SUBTITLE_EDITOR_AVAILABLE else "disabled"
+                    ),
                     self.prog_label.configure(text="完成"),
                 ])
             else:
@@ -944,6 +1075,12 @@ class App(ctk.CTk):
             self._file_log(f"❌ 錯誤：{e}")
             self.after(0, lambda: self.prog_bar.set(0))
         finally:
+            # 清理臨時 WAV
+            if tmp_wav and tmp_wav.exists():
+                try:
+                    tmp_wav.unlink()
+                except Exception:
+                    pass
             self._converting = False
             self.after(0, lambda: self.convert_btn.configure(
                 state="normal", text="▶  開始轉換"
@@ -1026,6 +1163,52 @@ class App(ctk.CTk):
                 t = end + 0.1
         messagebox.showinfo("儲存完成", f"已儲存至：\n{out}")
         os.startfile(str(SRT_DIR))
+
+    # ── 字幕驗證 ──────────────────────────────────────
+
+    def _on_open_subtitle_editor(self):
+        if not self._srt_output or not self._srt_output.exists():
+            messagebox.showwarning("提示", "尚無字幕輸出，請先轉換音檔")
+            return
+        if not _SUBTITLE_EDITOR_AVAILABLE:
+            messagebox.showwarning("提示",
+                "找不到 subtitle_editor.py，無法開啟字幕驗證視窗\n"
+                "請確認 subtitle_editor.py 與 app-gpu.py 在同一目錄")
+            return
+        SubtitleEditorWindow(
+            self,
+            srt_path=self._srt_output,
+            audio_path=self._audio_file,
+            diarize_mode=getattr(self, "_file_diarize", False),
+        )
+
+    # ── 批次辨識 tab ──────────────────────────────────
+
+    def _build_batch_tab(self, parent):
+        try:
+            from batch_tab import BatchTab
+        except ImportError:
+            ctk.CTkLabel(
+                parent,
+                text="找不到 batch_tab.py，批次辨識功能不可用",
+                font=FONT_BODY, text_color="#888888",
+            ).pack(pady=40)
+            return
+
+        tab_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        tab_frame.pack(fill="both", expand=True)
+        tab_frame.columnconfigure(0, weight=1)
+        tab_frame.rowconfigure(0, weight=1)
+
+        self._batch_tab = BatchTab(
+            tab_frame,
+            engine=None,  # 載入完成後再注入
+            open_subtitle_cb=lambda srt, audio, dz:
+                SubtitleEditorWindow(self, srt, audio, dz)
+                if _SUBTITLE_EDITOR_AVAILABLE else
+                messagebox.showinfo("提示", f"SRT 已儲存：{srt}"),
+        )
+        self._batch_tab.grid(row=0, column=0, sticky="nsew")
 
     # ── 關閉處理 ───────────────────────────────────────
 

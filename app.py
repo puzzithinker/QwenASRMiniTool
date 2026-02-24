@@ -24,12 +24,11 @@ del _os, _sys, _io, _stream_name, _s
 import json
 import os
 import re
-import subprocess
 import sys
+import tempfile
 import time
 import threading
 import queue
-import webbrowser
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -184,6 +183,9 @@ def _assign_ts(lines: list[str], g0: float, g1: float) -> list[tuple[float, floa
     return res
 
 
+# 全域：是否輸出簡體中文（True = 跳過 OpenCC 繁化）
+_g_output_simplified: bool = False
+
 # ══════════════════════════════════════════════════════
 # ASR 引擎
 # ══════════════════════════════════════════════════════
@@ -303,7 +305,8 @@ class ASREngine:
             raw = self.processor.decode(gen)
             if "<asr_text>" in raw:
                 raw = raw.split("<asr_text>", 1)[1]
-            return self.cc.convert(raw.strip())
+            text = raw.strip()
+            return text if _g_output_simplified else self.cc.convert(text)
 
     def _enforce_chunk_limit(
         self,
@@ -539,7 +542,8 @@ class ASREngine1p7B(ASREngine):
             raw = self.processor.decode(gen)
             if "<asr_text>" in raw:
                 raw = raw.split("<asr_text>", 1)[1]
-            return self.cc.convert(raw.strip())
+            text = raw.strip()
+            return text if _g_output_simplified else self.cc.convert(text)
 
 
 # ══════════════════════════════════════════════════════
@@ -571,10 +575,13 @@ class RealtimeManager:
     def start(self):
         import sounddevice as sd
         self._running = True
+        # 查詢裝置原生聲道數：立體聲混音等 loopback 裝置需要 2ch
+        dev_info      = sd.query_devices(self.dev_idx, "input")
+        self._native_ch = max(1, int(dev_info["max_input_channels"]))
         self._stream  = sd.InputStream(
             device=self.dev_idx,
             samplerate=SAMPLE_RATE,
-            channels=1,
+            channels=self._native_ch,
             blocksize=VAD_CHUNK,
             dtype="float32",
             callback=self._audio_cb,
@@ -592,7 +599,9 @@ class RealtimeManager:
         self.on_status("⏹ 已停止")
 
     def _audio_cb(self, indata, frames, time_info, status):
-        self._q.put(indata[:, 0].copy())
+        # 多聲道混音取平均轉 mono（立體聲混音 / WASAPI loopback 2ch）
+        mono = indata.mean(axis=1) if indata.shape[1] > 1 else indata[:, 0]
+        self._q.put(mono.copy())
 
     def _loop(self):
         h   = np.zeros((2, 1, 64), dtype=np.float32)
@@ -651,388 +660,9 @@ FONT_TITLE = ("Microsoft JhengHei", 22, "bold")
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 字幕驗證 & 編輯視窗
+# 字幕驗證 & 編輯視窗（共用模組 subtitle_editor.py）
 # ══════════════════════════════════════════════════════════════════════
-
-class SubtitleEditorWindow(ctk.CTkToplevel):
-    """字幕逐條驗證、段落試聽與編輯的獨立子視窗。
-
-    功能：
-      - 逐條顯示 SRT 字幕（起迄時間可直接編輯）
-      - ▶ 段落試聽：從音訊指定時間點播放到結束點後停止
-      - (+) / (−)：在指定條目後新增 / 刪除條目
-      - 多說話者模式：不同顏色區別說話者，可下拉切換，可命名
-      - 確認儲存 → <原檔>_edited_<時間戳>.srt
-    """
-
-    # 每位說話者的行背景色（深色主題）
-    _SPK_ROW_BG = [
-        "#122030",  # 0 深藍
-        "#102010",  # 1 深綠
-        "#241508",  # 2 深橙棕
-        "#1C1028",  # 3 深紫
-        "#281010",  # 4 深紅
-        "#0E2020",  # 5 深青
-    ]
-    # 說話者強調色（文字 / 邊框 / 按鈕）
-    _SPK_ACCENT = [
-        "#5DADE2",  # 0 亮藍
-        "#58D68D",  # 1 亮綠
-        "#F0B27A",  # 2 橙
-        "#C39BD3",  # 3 紫
-        "#F1948A",  # 4 粉紅
-        "#76D7C4",  # 5 青
-    ]
-
-    def __init__(
-        self,
-        parent,
-        srt_path: Path,
-        audio_path: "Path | None",
-        diarize_mode: bool = False,
-    ):
-        super().__init__(parent)
-        self.srt_path     = srt_path
-        self.audio_path   = audio_path
-        self.diarize_mode = diarize_mode
-
-        self._audio_data: "np.ndarray | None" = None
-        self._audio_sr   = 16000
-        self._rows: list[dict] = []   # 每條 = {start, end, speaker, text} StringVar
-
-        raw = self._parse_srt(srt_path)
-        self._all_spk_ids: list[str] = sorted({e["speaker"] for e in raw if e["speaker"]})
-        self.has_speakers = bool(self._all_spk_ids) and diarize_mode
-
-        # 說話者顯示名稱（使用者可修改，預設「說話者1」…）
-        self._spk_name_vars: dict[str, ctk.StringVar] = {
-            sid: ctk.StringVar(value=f"說話者{i + 1}")
-            for i, sid in enumerate(self._all_spk_ids)
-        }
-        self._init_rows(raw)
-        self._build_ui()
-
-        if audio_path and audio_path.exists():
-            threading.Thread(target=self._load_audio, daemon=True).start()
-
-    # ── SRT 解析 ─────────────────────────────────────────────────────
-
-    def _parse_srt(self, path: Path) -> list[dict]:
-        text   = path.read_text(encoding="utf-8")
-        blocks = re.split(r"\n\s*\n", text.strip())
-        out: list[dict] = []
-        for block in blocks:
-            lines = block.strip().splitlines()
-            if len(lines) < 3:
-                continue
-            m = re.match(
-                r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})",
-                lines[1],
-            )
-            if not m:
-                continue
-            content = " ".join(l.strip() for l in lines[2:])
-            speaker = ""
-            sm = re.match(r"^(說話者\d+|Speaker\s*\d+)：(.+)$", content, re.DOTALL)
-            if sm:
-                speaker = sm.group(1)
-                content = sm.group(2).strip()
-            out.append({
-                "start": m.group(1), "end": m.group(2),
-                "speaker": speaker,  "text": content,
-            })
-        return out
-
-    def _init_rows(self, entries: list[dict]):
-        self._rows = [
-            {
-                "start":   ctk.StringVar(value=e["start"]),
-                "end":     ctk.StringVar(value=e["end"]),
-                "speaker": ctk.StringVar(value=e["speaker"]),
-                "text":    ctk.StringVar(value=e["text"]),
-            }
-            for e in entries
-        ]
-
-    @staticmethod
-    def _ts_to_sec(ts: str) -> float:
-        try:
-            h, m, rest = ts.split(":")
-            s, ms = rest.split(",")
-            return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
-        except Exception:
-            return 0.0
-
-    # ── UI 建構 ──────────────────────────────────────────────────────
-
-    def _build_ui(self):
-        self.title(f"字幕驗證編輯器 — {self.srt_path.name}")
-        self.geometry("960x680")
-        self.resizable(True, True)
-        self.minsize(720, 420)
-        self.grab_set()
-
-        if self.has_speakers:
-            self._build_spk_name_bar()
-        self._build_header()
-
-        self._sf = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self._sf.pack(fill="both", expand=True, padx=6, pady=(0, 4))
-
-        self._rebuild_rows()
-        self._build_bottom()
-
-    def _build_spk_name_bar(self):
-        bar = ctk.CTkFrame(self, fg_color="#1A1A2E", corner_radius=8)
-        bar.pack(fill="x", padx=6, pady=(8, 2))
-        ctk.CTkLabel(
-            bar, text="說話者命名：",
-            font=("Microsoft JhengHei", 12, "bold"), text_color="#888899",
-        ).pack(side="left", padx=(10, 8), pady=6)
-        for i, sid in enumerate(self._all_spk_ids):
-            accent = self._SPK_ACCENT[i % len(self._SPK_ACCENT)]
-            ctk.CTkLabel(
-                bar, text=f"{sid}：",
-                font=("Microsoft JhengHei", 12), text_color=accent,
-            ).pack(side="left", padx=(0, 2))
-            ctk.CTkEntry(
-                bar, textvariable=self._spk_name_vars[sid],
-                width=80, height=28, font=("Microsoft JhengHei", 12),
-            ).pack(side="left", padx=(0, 14))
-
-    def _build_header(self):
-        hdr = ctk.CTkFrame(self, fg_color="#1E1E32", corner_radius=0, height=26)
-        hdr.pack(fill="x", padx=6, pady=(2, 0))
-        hdr.pack_propagate(False)
-        cols = [("  #", 36), ("起始時間", 110), (" ", 22), ("結束時間", 110)]
-        if self.has_speakers:
-            cols.append(("說話者", 98))
-        cols.append(("字幕文字", 0))
-        cols.append(("操作", 98))
-        for txt, w in cols:
-            kw: dict = dict(
-                text=txt, font=("Microsoft JhengHei", 11),
-                text_color="#55556A", anchor="w",
-            )
-            if w:
-                kw["width"] = w
-            ctk.CTkLabel(hdr, **kw).pack(side="left", padx=(4, 0))
-
-    def _rebuild_rows(self):
-        for w in self._sf.winfo_children():
-            w.destroy()
-        for i, row in enumerate(self._rows):
-            self._build_one_row(i, row)
-
-    def _build_one_row(self, idx: int, row: dict):
-        spk_id = row["speaker"].get()
-        ci = self._all_spk_ids.index(spk_id) if spk_id in self._all_spk_ids else -1
-
-        if self.has_speakers and ci >= 0:
-            bg = self._SPK_ROW_BG[ci % len(self._SPK_ROW_BG)]
-        else:
-            bg = "#1C1C1C" if idx % 2 == 0 else "#222228"
-
-        # 行 frame（pack 到 scroll frame）
-        fr = ctk.CTkFrame(self._sf, fg_color=bg, corner_radius=4)
-        fr.pack(fill="x", padx=2, pady=1)
-
-        # 文字欄使用 grid weight 佔滿剩餘寬度
-        text_col = 5 if self.has_speakers else 4
-        fr.columnconfigure(text_col, weight=1)
-
-        col = 0
-        # 序號
-        ctk.CTkLabel(
-            fr, text=str(idx + 1), width=32, anchor="e",
-            font=("Consolas", 11), text_color="#555566",
-        ).grid(row=0, column=col, padx=(6, 2), pady=5)
-        col += 1
-
-        # 起始時間
-        ctk.CTkEntry(
-            fr, textvariable=row["start"], width=108, height=28,
-            font=FONT_MONO, justify="center",
-        ).grid(row=0, column=col, padx=(2, 0), pady=4)
-        col += 1
-
-        # 箭頭
-        ctk.CTkLabel(
-            fr, text="→", width=22, font=("Microsoft JhengHei", 12),
-            text_color="#444455",
-        ).grid(row=0, column=col)
-        col += 1
-
-        # 結束時間
-        ctk.CTkEntry(
-            fr, textvariable=row["end"], width=108, height=28,
-            font=FONT_MONO, justify="center",
-        ).grid(row=0, column=col, padx=(0, 4), pady=4)
-        col += 1
-
-        # 說話者下拉（多說話者模式）
-        if self.has_speakers:
-            accent = self._SPK_ACCENT[ci % len(self._SPK_ACCENT)] if ci >= 0 else "#666677"
-            ctk.CTkComboBox(
-                fr, variable=row["speaker"], values=list(self._all_spk_ids),
-                width=94, height=28, font=("Microsoft JhengHei", 11),
-                button_color=accent, border_color=accent,
-                command=lambda v, i=idx: self._on_spk_change(i),
-            ).grid(row=0, column=col, padx=(0, 4), pady=4)
-            col += 1
-
-        # 字幕文字（sticky="ew" 填滿剩餘寬度）
-        ctk.CTkEntry(
-            fr, textvariable=row["text"], height=28,
-            font=("Microsoft JhengHei", 12),
-        ).grid(row=0, column=col, sticky="ew", padx=(0, 4), pady=4)
-        col += 1
-
-        # 操作按鈕組
-        btn_fr = ctk.CTkFrame(fr, fg_color="transparent")
-        btn_fr.grid(row=0, column=col, padx=(0, 6), pady=4)
-
-        ctk.CTkButton(
-            btn_fr, text="+", width=26, height=26,
-            fg_color="#1B4A1B", hover_color="#28602A",
-            font=("Consolas", 13, "bold"),
-            command=lambda i=idx: self._add_after(i),
-        ).pack(side="left", padx=(0, 2))
-
-        ctk.CTkButton(
-            btn_fr, text="−", width=26, height=26,
-            fg_color="#4A1B1B", hover_color="#602828",
-            font=("Consolas", 13, "bold"),
-            command=lambda i=idx: self._delete(i),
-        ).pack(side="left", padx=(0, 2))
-
-        ctk.CTkButton(
-            btn_fr, text="▶", width=34, height=26,
-            fg_color="#1A3A5C", hover_color="#265A8A",
-            font=("Microsoft JhengHei", 11),
-            command=lambda r=row: self._play(r),
-        ).pack(side="left")
-
-    # ── 行操作 ───────────────────────────────────────────────────────
-
-    def _on_spk_change(self, idx: int):
-        """說話者切換後重建行（更新背景色）。"""
-        self._rebuild_rows()
-
-    def _add_after(self, idx: int):
-        """在 idx 後插入空白行，起迄時間繼承當前行的結束點。"""
-        cur_end = self._rows[idx]["end"].get()
-        self._rows.insert(idx + 1, {
-            "start":   ctk.StringVar(value=cur_end),
-            "end":     ctk.StringVar(value=cur_end),
-            "speaker": ctk.StringVar(value=self._rows[idx]["speaker"].get()),
-            "text":    ctk.StringVar(value=""),
-        })
-        self._rebuild_rows()
-
-    def _delete(self, idx: int):
-        if len(self._rows) <= 1:
-            return
-        del self._rows[idx]
-        self._rebuild_rows()
-
-    # ── 音訊播放 ─────────────────────────────────────────────────────
-
-    def _play(self, row: dict):
-        """段落試聽：從起始時間播放到結束時間後自動停止。"""
-        try:
-            import sounddevice as sd
-            sd.stop()
-            if self._audio_data is None:
-                return
-            s  = self._ts_to_sec(row["start"].get())
-            e  = self._ts_to_sec(row["end"].get())
-            if e <= s:
-                return
-            si  = max(0, int(s * self._audio_sr))
-            ei  = min(len(self._audio_data), int(e * self._audio_sr))
-            seg = self._audio_data[si:ei]
-            if len(seg) > 0:
-                sd.play(seg, self._audio_sr)
-        except Exception:
-            pass
-
-    def _load_audio(self):
-        """背景執行緒載入音訊（soundfile 優先，librosa 備用）。"""
-        try:
-            import soundfile as sf
-            data, sr = sf.read(str(self.audio_path), always_2d=False, dtype="float32")
-            if data.ndim > 1:
-                data = data.mean(axis=1)
-            if sr != 16000:
-                import librosa
-                data = librosa.resample(data, orig_sr=sr, target_sr=16000)
-            self._audio_data = data
-            self._audio_sr   = 16000
-        except Exception:
-            try:
-                import librosa
-                data, _ = librosa.load(str(self.audio_path), sr=16000, mono=True)
-                self._audio_data = data
-                self._audio_sr   = 16000
-            except Exception:
-                self._audio_data = None
-
-    # ── 底部操作列 ───────────────────────────────────────────────────
-
-    def _build_bottom(self):
-        bot = ctk.CTkFrame(self, fg_color="#14141E", corner_radius=0, height=54)
-        bot.pack(fill="x", side="bottom")
-        bot.pack_propagate(False)
-
-        ctk.CTkLabel(
-            bot, text="確認後儲存為 ＊_edited_時間戳.srt",
-            font=("Microsoft JhengHei", 11), text_color="#40405A",
-        ).pack(side="left", padx=14)
-
-        ctk.CTkButton(
-            bot, text="✖  取消", width=100, height=36,
-            fg_color="#38181A", hover_color="#552428",
-            font=("Microsoft JhengHei", 13),
-            command=self._cancel,
-        ).pack(side="right", padx=8, pady=9)
-
-        ctk.CTkButton(
-            bot, text="✔  確認儲存", width=130, height=36,
-            fg_color="#183A1A", hover_color="#245528",
-            font=("Microsoft JhengHei", 13, "bold"),
-            command=self._save,
-        ).pack(side="right", padx=(0, 4), pady=9)
-
-    def _stop_audio(self):
-        try:
-            import sounddevice as sd
-            sd.stop()
-        except Exception:
-            pass
-
-    def _cancel(self):
-        self._stop_audio()
-        self.destroy()
-
-    def _save(self):
-        self._stop_audio()
-        ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = self.srt_path.parent / f"{self.srt_path.stem}_edited_{ts}.srt"
-        with open(out_path, "w", encoding="utf-8") as f:
-            for i, row in enumerate(self._rows, 1):
-                start = row["start"].get()
-                end   = row["end"].get()
-                text  = row["text"].get().strip()
-                spk   = row["speaker"].get()
-                if self.has_speakers and spk and spk in self._spk_name_vars:
-                    display = self._spk_name_vars[spk].get() or spk
-                    prefix  = f"{display}："
-                else:
-                    prefix = ""
-                f.write(f"{i}\n{start} --> {end}\n{prefix}{text}\n\n")
-        messagebox.showinfo("已儲存", f"字幕已儲存至：\n{out_path}", parent=self)
-        self.destroy()
+from subtitle_editor import SubtitleDetailEditor, SubtitleEditorWindow  # noqa: F401
 
 
 class App(ctk.CTk):
@@ -1058,8 +688,6 @@ class App(ctk.CTk):
         self._file_hint: str | None          = None   # 音檔轉字幕 hint
         self._file_diarize: bool             = False  # 說話者分離開關
         self._file_n_speakers: int | None    = None   # 指定說話者人數（None=自動）
-        self._sl_process: subprocess.Popen | None = None  # Streamlit 子程序
-        self._sl_port: int                   = 8501   # Streamlit 監聽連接埠
 
         self._build_ui()
         self._detect_all_devices()
@@ -1138,12 +766,34 @@ class App(ctk.CTk):
         self.tabs = ctk.CTkTabview(self, anchor="nw")
         self.tabs.pack(fill="both", expand=True, padx=10, pady=(8, 10))
         self.tabs.add("  音檔轉字幕  ")
+        self.tabs.add("  批次辨識  ")
         self.tabs.add("  即時轉換  ")
-        self.tabs.add("  服務設定  ")
+        self.tabs.add("  設定  ")
 
         self._build_file_tab(self.tabs.tab("  音檔轉字幕  "))
+        self._build_batch_tab(self.tabs.tab("  批次辨識  "))
         self._build_rt_tab(self.tabs.tab("  即時轉換  "))
-        self._build_service_tab(self.tabs.tab("  服務設定  "))
+
+        from setting import SettingsTab
+        self._settings_tab = SettingsTab(
+            self.tabs.tab("  設定  "), self, show_service=True)
+        self._settings_tab.pack(fill="both", expand=True)
+
+    # ── 批次辨識 tab ───────────────────────────────────
+
+    def _build_batch_tab(self, parent):
+        from batch_tab import BatchTab
+        tab_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        tab_frame.pack(fill="both", expand=True)
+        tab_frame.columnconfigure(0, weight=1)
+        tab_frame.rowconfigure(0, weight=1)
+        self._batch_tab = BatchTab(
+            tab_frame,
+            engine=None,   # 引擎於模型載入完成後注入（_on_models_ready）
+            open_subtitle_cb=lambda srt, audio, dz:
+                SubtitleEditorWindow(self, srt, audio, dz),
+        )
+        self._batch_tab.grid(row=0, column=0, sticky="nsew")
 
     # ── 音檔轉字幕 tab ─────────────────────────────────
 
@@ -1359,269 +1009,6 @@ class App(ctk.CTk):
             font=FONT_BODY, command=self._on_rt_save,
         ).pack(side="left")
 
-    # ── Streamlit 服務設定 tab ─────────────────────────
-
-    def _build_service_tab(self, parent):
-        # 說明區
-        ctk.CTkLabel(
-            parent,
-            text="🌐 Streamlit 網頁服務",
-            font=("Microsoft JhengHei", 14, "bold"),
-            anchor="w",
-        ).pack(fill="x", padx=12, pady=(14, 2))
-        ctk.CTkLabel(
-            parent,
-            text="在本機啟動網頁版前端，啟動後點選按鈕開啟瀏覽器，不會自動彈出視窗。",
-            font=FONT_BODY, text_color="#AAAAAA", anchor="w",
-        ).pack(fill="x", padx=12, pady=(0, 10))
-
-        # 狀態列
-        status_row = ctk.CTkFrame(parent, fg_color="transparent")
-        status_row.pack(fill="x", padx=12, pady=(0, 4))
-        self._sl_status_dot = ctk.CTkLabel(
-            status_row, text="⚫", font=FONT_BODY, width=28, anchor="w"
-        )
-        self._sl_status_dot.pack(side="left")
-        self._sl_status_lbl = ctk.CTkLabel(
-            status_row, text="服務未啟動", font=FONT_BODY, anchor="w"
-        )
-        self._sl_status_lbl.pack(side="left")
-
-        # 連接埠列
-        port_row = ctk.CTkFrame(parent, fg_color="transparent")
-        port_row.pack(fill="x", padx=12, pady=4)
-        ctk.CTkLabel(port_row, text="連接埠：", font=FONT_BODY).pack(side="left")
-        self._sl_port_var = ctk.StringVar(value="8501")
-        self._sl_port_entry = ctk.CTkEntry(
-            port_row, textvariable=self._sl_port_var,
-            width=80, height=32, font=FONT_BODY,
-        )
-        self._sl_port_entry.pack(side="left", padx=(4, 0))
-
-        # 控制按鈕列
-        btn_row = ctk.CTkFrame(parent, fg_color="transparent")
-        btn_row.pack(fill="x", padx=12, pady=4)
-        self._sl_start_btn = ctk.CTkButton(
-            btn_row, text="▶  啟動服務",
-            width=120, height=34, font=FONT_BODY,
-            command=self._on_sl_start,
-        )
-        self._sl_start_btn.pack(side="left", padx=(0, 8))
-        self._sl_stop_btn = ctk.CTkButton(
-            btn_row, text="■  停止服務",
-            width=120, height=34, font=FONT_BODY,
-            fg_color="gray35", hover_color="gray25",
-            state="disabled",
-            command=self._on_sl_stop,
-        )
-        self._sl_stop_btn.pack(side="left")
-
-        # URL 列
-        url_row = ctk.CTkFrame(parent, fg_color="transparent")
-        url_row.pack(fill="x", padx=12, pady=(6, 2))
-        ctk.CTkLabel(url_row, text="連線位址：", font=FONT_BODY).pack(side="left")
-        self._sl_url_lbl = ctk.CTkLabel(
-            url_row, text="—", font=FONT_BODY,
-            text_color="#7dd3fc", cursor="hand2",
-        )
-        self._sl_url_lbl.pack(side="left", padx=(4, 10))
-        self._sl_url_lbl.bind("<Button-1>", lambda _: self._on_sl_open())
-        self._sl_open_btn = ctk.CTkButton(
-            url_row, text="🌐  開啟瀏覽器",
-            width=130, height=30, font=FONT_BODY,
-            state="disabled", command=self._on_sl_open,
-        )
-        self._sl_open_btn.pack(side="left")
-        self._sl_copy_btn = ctk.CTkButton(
-            url_row, text="📋  複製",
-            width=80, height=30, font=FONT_BODY,
-            state="disabled", command=self._on_sl_copy_url,
-        )
-        self._sl_copy_btn.pack(side="left", padx=(6, 0))
-
-        # 日誌
-        ctk.CTkLabel(
-            parent, text="服務日誌：",
-            font=FONT_BODY, text_color="#AAAAAA", anchor="w",
-        ).pack(fill="x", padx=12, pady=(10, 2))
-        self._sl_log_box = ctk.CTkTextbox(
-            parent, font=("Consolas", 11), state="disabled", height=160,
-        )
-        self._sl_log_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-
-    # ── Streamlit 服務輔助方法 ──────────────────────────
-
-    def _get_python_exe(self) -> Path:
-        """取得可執行的 Python 解譯器路徑。
-        EXE 模式下，PyInstaller bootloader 本身不可做 `python -m`，
-        因此在 BASE_DIR/_python/ 尋找 python.exe（由 build.bat 複製進來）。
-
-        python.exe 放在 _python\ 子目錄（非 EXE 所在根目錄）的原因：
-        若 python3XX.dll 與 QwenASR.exe 同層，Windows DLL loader 會同時載入
-        兩份不同 Python DLL（PyInstaller 的 _internal\ 版本 + venv 版本），
-        造成 DLL 衝突與每段辨識時的視窗閃爍問題。
-        """
-        if getattr(sys, "frozen", False):
-            for cand in [
-                BASE_DIR / "_python" / "python.exe",   # 新版 build.bat 位置（避免 DLL 衝突）
-                BASE_DIR / "python.exe",               # 舊版相容（build 後手動放置的情況）
-                BASE_DIR / "_internal" / "python.exe",
-            ]:
-                if cand.exists():
-                    return cand
-            # 找不到時回傳 EXE 本身（會失敗，但讓錯誤訊息清楚）
-            return Path(sys.executable)
-        return Path(sys.executable)
-
-    def _on_sl_start(self):
-        """啟動 Streamlit 服務（子程序）。"""
-        sl_script = BASE_DIR / "streamlit_app.py"
-        if not sl_script.exists():
-            self._sl_append_log("❌ 找不到 streamlit_app.py，無法啟動服務")
-            return
-
-        try:
-            port = int(self._sl_port_var.get())
-        except ValueError:
-            port = 8501
-            self._sl_port_var.set("8501")
-        self._sl_port = port
-
-        py_exe = self._get_python_exe()
-        _NO_WIN = 0x08000000 if sys.platform == "win32" else 0
-        cmd = [
-            str(py_exe), "-m", "streamlit", "run",
-            str(sl_script),
-            "--server.port",              str(port),
-            "--server.headless",          "true",
-            "--browser.gatherUsageStats", "false",
-        ]
-        self._sl_append_log(
-            f"▶ 啟動：streamlit run streamlit_app.py --server.port {port}"
-        )
-        self._sl_append_log("⏳ 等待 Streamlit 初始化（通常需要 5–15 秒）…")
-        try:
-            self._sl_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                cwd=str(BASE_DIR),       # 確保工作目錄正確
-                creationflags=_NO_WIN,
-            )
-        except Exception as e:
-            self._sl_append_log(f"❌ 啟動失敗：{e}")
-            return
-
-        # 顯示「啟動中」狀態（黃燈），等解析到 "Local URL:" 才標記就緒
-        self._sl_status_dot.configure(text="🟡")
-        self._sl_status_lbl.configure(text="啟動中…")
-        self._sl_start_btn.configure(state="disabled")
-        self._sl_stop_btn.configure(state="normal")
-        self._sl_port_entry.configure(state="disabled")
-
-        threading.Thread(target=self._sl_log_reader, daemon=True).start()
-        threading.Thread(target=self._sl_monitor,    daemon=True).start()
-
-    def _on_sl_stop(self):
-        """停止 Streamlit 服務。"""
-        proc, self._sl_process = self._sl_process, None
-        if proc:
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-        self._sl_on_stopped()
-        self._sl_append_log("■ 服務已手動停止")
-
-    def _on_sl_open(self):
-        """在預設瀏覽器中開啟 Streamlit 網頁。"""
-        url = self._sl_url_lbl.cget("text")
-        if url and url != "—":
-            webbrowser.open(url)
-        else:
-            webbrowser.open(f"http://localhost:{self._sl_port}")
-
-    def _on_sl_copy_url(self):
-        """複製 URL 到剪貼簿。"""
-        url = self._sl_url_lbl.cget("text")
-        if not url or url == "—":
-            url = f"http://localhost:{self._sl_port}"
-        self.clipboard_clear()
-        self.clipboard_append(url)
-        self._sl_copy_btn.configure(text="✅  已複製")
-        self.after(2000, lambda: self._sl_copy_btn.configure(text="📋  複製"))
-
-    def _sl_append_log(self, text: str):
-        """（可跨執行緒）在服務日誌框末尾追加一行。"""
-        def _do():
-            ts = datetime.now().strftime("%H:%M:%S")
-            self._sl_log_box.configure(state="normal")
-            self._sl_log_box.insert("end", f"[{ts}] {text}\n")
-            self._sl_log_box.see("end")
-            self._sl_log_box.configure(state="disabled")
-        self.after(0, _do)
-
-    def _sl_log_reader(self):
-        """背景：讀取 Streamlit stdout；解析 'Local URL:' 偵測就緒。"""
-        _ANSI = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
-        proc   = self._sl_process
-        if not proc or not proc.stdout:
-            return
-
-        for raw in proc.stdout:
-            line = _ANSI.sub("", raw).rstrip()
-            if not line:
-                continue
-            self._sl_append_log(line)
-
-            # Streamlit 就緒訊號（含 URL）
-            # 典型格式：  Local URL: http://localhost:8501
-            if "Local URL:" in line:
-                url = line.split("Local URL:")[-1].strip()
-                self.after(0, lambda u=url: self._sl_on_ready(u))
-
-        # stdout 關閉代表程序已結束
-        if self._sl_process is not None:   # 非手動停止
-            self.after(0, self._sl_on_stopped)
-
-    def _sl_monitor(self):
-        """背景：等待程序退出（確保 stdout 讀完後狀態正確同步）。"""
-        proc = self._sl_process
-        if proc:
-            proc.wait()
-        if self._sl_process is not None:   # 非手動停止
-            self._sl_process = None
-            self.after(0, self._sl_on_stopped)
-
-    def _sl_on_ready(self, url: str):
-        """Streamlit 已就緒 → 更新 UI（主執行緒）。"""
-        self._sl_status_dot.configure(text="🟢")
-        self._sl_status_lbl.configure(text="服務就緒")
-        self._sl_url_lbl.configure(text=url)
-        self._sl_open_btn.configure(state="normal")
-        self._sl_copy_btn.configure(state="normal")
-        self._sl_append_log(f"✅ 服務就緒：{url}")
-
-    def _sl_on_stopped(self):
-        """程序退出後重設 UI（主執行緒）。"""
-        self._sl_status_dot.configure(text="⚫")
-        self._sl_status_lbl.configure(text="服務未啟動")
-        self._sl_url_lbl.configure(text="—")
-        self._sl_start_btn.configure(state="normal")
-        self._sl_stop_btn.configure(state="disabled")
-        self._sl_open_btn.configure(state="disabled")
-        self._sl_copy_btn.configure(state="disabled")
-        self._sl_port_entry.configure(state="normal")
-
-    # ── 模型載入 ───────────────────────────────────────
-
     # ── 說話者分離 UI 輔助 ───────────────────────────────────────────
 
     def _on_diarize_toggle(self):
@@ -1788,6 +1175,31 @@ class App(ctk.CTk):
         except Exception:
             pass
 
+    def _patch_setting(self, key: str, value):
+        """讀取現有設定、更新單一 key，再寫回 settings.json。"""
+        s = self._load_settings()
+        s[key] = value
+        self._save_settings(s)
+
+    def _apply_ui_prefs(self, settings: dict):
+        """主執行緒：根據儲存的偏好設定同步 UI 控件與外觀。"""
+        mode = settings.get("appearance_mode", "dark")
+        ctk.set_appearance_mode(mode)
+        if hasattr(self, "_settings_tab"):
+            self._settings_tab.sync_prefs(settings)
+
+    def _on_chinese_mode_change(self, value: str):
+        """輸出模式切換：繁體（OpenCC）or 簡體（直接輸出）。"""
+        global _g_output_simplified
+        _g_output_simplified = (value == "簡體")
+        self._patch_setting("output_simplified", _g_output_simplified)
+
+    def _on_appearance_change(self, value: str):
+        """主題切換：深色 🌑 or 淺色 ☀。"""
+        mode = "light" if value == "☀" else "dark"
+        ctk.set_appearance_mode(mode)
+        self._patch_setting("appearance_mode", mode)
+
     def _settings_valid(self, s: dict) -> bool:
         """檢查設定是否足夠完整（不需要重新引導）。"""
         if not s:
@@ -1856,6 +1268,11 @@ class App(ctk.CTk):
             self._save_settings(settings)
 
         self._settings = settings
+
+        # 套用 UI 偏好（簡繁模式 + 外觀主題）
+        global _g_output_simplified
+        _g_output_simplified = settings.get("output_simplified", False)
+        self.after(0, lambda s=settings: self._apply_ui_prefs(s))
 
         # 同步 device_combo 到已儲存的裝置
         saved_dev = settings.get("device", "CPU")
@@ -2335,6 +1752,9 @@ class App(ctk.CTk):
         self.reload_btn.configure(state="normal")
         self.convert_btn.configure(state="normal")
         self.rt_start_btn.configure(state="normal")
+        # 注入引擎到批次辨識頁籤
+        if hasattr(self, "_batch_tab"):
+            self._batch_tab.set_engine(self.engine)
 
         settings = self._settings or {}
         backend  = settings.get("backend", "openvino")
@@ -2519,9 +1939,13 @@ class App(ctk.CTk):
 
     def _on_browse(self):
         path = filedialog.askopenfilename(
-            title="選擇音訊檔案",
+            title="選擇音訊 / 影片檔案",
             filetypes=[
-                ("音訊檔案", "*.mp3 *.wav *.flac *.m4a *.ogg *.aac"),
+                ("音訊 / 影片檔案",
+                 "*.mp3 *.wav *.flac *.m4a *.ogg *.aac *.opus *.wma "
+                 "*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm *.ts"),
+                ("音訊檔案", "*.mp3 *.wav *.flac *.m4a *.ogg *.aac *.opus *.wma"),
+                ("影片檔案", "*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm *.ts *.m2ts"),
                 ("所有檔案", "*.*"),
             ],
         )
@@ -2566,6 +1990,20 @@ class App(ctk.CTk):
         self._file_n_speakers = (int(n_spk_sel)
                                   if n_spk_sel.isdigit() else None)
 
+        # 影片檔案需要 ffmpeg → 先確保可用
+        from ffmpeg_utils import is_video, ensure_ffmpeg
+        if is_video(path):
+            def _on_ffmpeg_ready(ffmpeg_path):
+                self._ffmpeg_exe = ffmpeg_path
+                self._do_start_convert()
+            ensure_ffmpeg(self, on_ready=_on_ffmpeg_ready)
+            return   # 等 ensure_ffmpeg 回呼（同步有 ffmpeg 時也會回呼）
+
+        self._ffmpeg_exe = None
+        self._do_start_convert()
+
+    def _do_start_convert(self):
+        """ffmpeg 確認後（或非影片檔案時）實際啟動轉換執行緒。"""
         self._converting = True
         self.convert_btn.configure(state="disabled", text="轉換中…")
         self.prog_bar.set(0)
@@ -2580,6 +2018,7 @@ class App(ctk.CTk):
         context    = self._file_hint
         diarize    = getattr(self, "_file_diarize", False)
         n_speakers = getattr(self, "_file_n_speakers", None)
+        ffmpeg_exe = getattr(self, "_ffmpeg_exe", None)
 
         def prog_cb(done, total, msg):
             pct = done / total if total > 0 else 0
@@ -2587,8 +2026,24 @@ class App(ctk.CTk):
             self.after(0, lambda: self.prog_label.configure(text=msg))
             self._file_log(msg)
 
+        tmp_wav: Path | None = None
         try:
             t0 = time.perf_counter()
+            # 影片音軌提取
+            from ffmpeg_utils import is_video, extract_audio_to_wav
+            if is_video(path):
+                if not ffmpeg_exe:
+                    raise RuntimeError("找不到 ffmpeg，無法提取影片音軌。")
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+                os.close(tmp_fd)
+                tmp_wav = Path(tmp_path)
+                self._file_log(f"🎬 提取音軌中：{path.name}")
+                extract_audio_to_wav(path, tmp_wav, ffmpeg_exe)
+                self._file_log(f"   音軌提取完成，開始辨識…")
+                proc_path = tmp_wav
+            else:
+                proc_path = path
+
             lang_info  = f"  語系：{language or '自動'}"
             hint_info  = f"  提示：{context[:30]}…" if context and len(context) > 30 else (f"  提示：{context}" if context else "")
             if diarize:
@@ -2598,7 +2053,7 @@ class App(ctk.CTk):
                 diar_info = ""
             self._file_log(f"開始處理：{path.name}{lang_info}{hint_info}{diar_info}")
             srt = self.engine.process_file(
-                path, progress_cb=prog_cb, language=language,
+                proc_path, progress_cb=prog_cb, language=language,
                 context=context, diarize=diarize, n_speakers=n_speakers,
             )
             elapsed = time.perf_counter() - t0
@@ -2620,6 +2075,12 @@ class App(ctk.CTk):
             self._file_log(f"❌ 錯誤：{e}")
             self.after(0, lambda: self.prog_bar.set(0))
         finally:
+            # 清理臨時 WAV（影片音軌提取）
+            if tmp_wav and tmp_wav.exists():
+                try:
+                    tmp_wav.unlink()
+                except Exception:
+                    pass
             self._converting = False
             self.after(0, lambda: self.convert_btn.configure(
                 state="normal", text="▶  開始轉換"
@@ -2724,11 +2185,8 @@ class App(ctk.CTk):
                 return
 
         # 停止 Streamlit 服務
-        if self._sl_process:
-            try:
-                self._sl_process.terminate()
-            except Exception:
-                pass
+        if hasattr(self, "_settings_tab"):
+            self._settings_tab.stop_service()
 
         # 停止即時錄音（安靜地停，不需要確認）
         if self._rt_mgr:

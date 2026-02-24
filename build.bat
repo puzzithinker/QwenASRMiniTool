@@ -110,6 +110,10 @@ REM Chinese Windows (cp950 default encoding).
     --exclude-module triton ^
     --exclude-module bitsandbytes ^
     --noconfirm ^
+    --add-data "%SRC%\batch_tab.py;." ^
+    --add-data "%SRC%\ffmpeg_utils.py;." ^
+    --add-data "%SRC%\subtitle_editor.py;." ^
+    --add-data "%SRC%\setting.py;." ^
     %SRC%\app.py
 
 echo.
