@@ -66,10 +66,10 @@ _BIN_PATH          = next(
 )
 SRT_DIR.mkdir(exist_ok=True)
 
-# ── 常數 ──────────────────────────────────────────────
+# ── 常數 ────────# 常數
 SAMPLE_RATE   = 16000
 VAD_CHUNK     = 512
-VAD_THRESHOLD = 0.5
+VAD_THRESHOLD = 0.5   # 可由設定頁調整（降低可減少掴字）
 MAX_GROUP_SEC = 20
 MAX_CHARS     = 20
 MIN_SUB_SEC   = 0.6
@@ -141,22 +141,74 @@ def _detect_speech_groups(audio: np.ndarray, vad_sess, max_group_sec: int = MAX_
 
 
 def _split_to_lines(text: str) -> list[str]:
-    """以標點符號切分短句，移除標點，每句獨立成行。"""
+    """以標點符號切分短句，移除標點，每句獨立成行。
+
+    要點：
+    1. 中文/日文標點符號 → 立即切行（標點不保留）
+    2. 英文以空格分詞（整字為最小單位），超限則换行
+    3. 字元數超限 MAX_CHARS 時強制換行（中文/日文保護）
+    """
     if "<asr_text>" in text:
         text = text.split("<asr_text>", 1)[1]
     text = text.strip()
     if not text:
         return []
-    parts = re.split(r"[。！？，、；：…—,.!?;:]+", text)
-    lines = []
-    for p in parts:
-        p = p.strip()
-        if not p:
+
+    PUNCT = set("。！？，、；：…—、.,!?;:")
+    lines: list[str] = []
+    buf   = ""
+
+    # 按空格分詞（英文），保留間隔; 中文進行逗字扐游訪
+    i = 0
+    while i < len(text):
+        ch = text[i]
+
+        # ── 標點符號：立即切行，標點不加入輸出 ──────────────────
+        if ch in PUNCT:
+            if buf.strip():
+                lines.append(buf.strip())
+            buf = ""
+            i += 1
             continue
-        while len(p) > MAX_CHARS:
-            lines.append(p[:MAX_CHARS]); p = p[MAX_CHARS:]
-        lines.append(p)
+
+        # ── 英文单字：整詞收集，不在字母中間切斷 ──────────────
+        if ch.isalpha() and ord(ch) < 128:
+            j = i
+            while j < len(text) and text[j].isalpha() and ord(text[j]) < 128:
+                j += 1
+            word = text[i:j]
+            # 英文詞丫加空格 (buf 非空且未以空格結尾)
+            prefix = " " if buf and not buf.endswith(" ") else ""
+            if len(buf) + len(prefix) + len(word) > MAX_CHARS and buf.strip():
+                lines.append(buf.strip())
+                buf = word
+            else:
+                buf += prefix + word
+            i = j
+            continue
+
+        # ── 空格：部分情況擴展為換行點 ─────────────────────
+        if ch == " ":
+            # 英文已在上過處理 prefix，這裡只處理字元間空格 / 段尾空格
+            if buf and len(buf) >= MAX_CHARS:
+                lines.append(buf.strip())
+                buf = ""
+            elif buf and not buf.endswith(" "):
+                buf += " "   # 保留单一分詞空格
+            i += 1
+            continue
+
+        # ── 中文/日文字元：逗字加入 ────────────────────────
+        buf += ch
+        i += 1
+        if len(buf) >= MAX_CHARS:
+            lines.append(buf.strip())
+            buf = ""
+
+    if buf.strip():
+        lines.append(buf.strip())
     return [l for l in lines if l.strip()]
+
 
 
 def _srt_ts(s: float) -> str:
@@ -1185,8 +1237,13 @@ class App(ctk.CTk):
 
     def _apply_ui_prefs(self, settings: dict):
         """主執行緒：根據儲存的偏好設定同步 UI 控件與外觀。"""
+        global VAD_THRESHOLD
         mode = settings.get("appearance_mode", "dark")
         ctk.set_appearance_mode(mode)
+        # VAD 閾值：從設定還原
+        vad = settings.get("vad_threshold")
+        if vad is not None:
+            VAD_THRESHOLD = float(vad)
         if hasattr(self, "_settings_tab"):
             self._settings_tab.sync_prefs(settings)
 

@@ -97,6 +97,9 @@ class SettingsTab(ctk.CTkScrollableFrame):
         self._build_language_section()
         _hsep(self)
 
+        self._build_vad_section()
+        _hsep(self)
+
         self._build_model_path_section()
         _hsep(self)
 
@@ -246,7 +249,54 @@ class SettingsTab(ctk.CTkScrollableFrame):
         mapped = "簡體" if "簡" in value else "繁體"
         self._app._on_chinese_mode_change(mapped)
 
-    # ── 4. 模型路徑 ───────────────────────────────────────────────────
+    # ── 4. VAD 語音偵測阈値 ─────────────────────────────
+
+    def _build_vad_section(self):
+        ctk.CTkLabel(
+            self, text="🎤 語音偵測阈値（VAD Threshold）",
+            font=FONT_BODY, anchor="w",
+        ).pack(fill="x", padx=12, pady=(10, 2))
+
+        ctk.CTkLabel(
+            self,
+            text="降低阈値可減少漏識（部分被判定為空白的片段可能有聲音）；提高則減少假陽性。預設：0.50。",
+            font=FONT_SMALL, text_color=("gray40", "#AAAAAA"), anchor="w",
+            wraplength=480, justify="left",
+        ).pack(fill="x", padx=12, pady=(0, 4))
+
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=(0, 8))
+
+        self._vad_val_var = ctk.StringVar(value="0.50")
+        ctk.CTkLabel(row, textvariable=self._vad_val_var,
+                     font=FONT_BODY, width=44, anchor="e").pack(side="left")
+
+        self._vad_slider = ctk.CTkSlider(
+            row, from_=0.30, to=0.80, number_of_steps=50,
+            width=280, height=18,
+            command=self._on_vad_change,
+        )
+        self._vad_slider.set(0.50)
+        self._vad_slider.pack(side="left", padx=(8, 8))
+
+        ctk.CTkLabel(row, text="0.30",
+                     font=FONT_SMALL, text_color=("gray50", "#888888")).pack(side="left")
+        ctk.CTkLabel(row, text="–",
+                     font=FONT_SMALL, text_color=("gray50", "#888888")).pack(side="left", padx=2)
+        ctk.CTkLabel(row, text="0.80",
+                     font=FONT_SMALL, text_color=("gray50", "#888888")).pack(side="left")
+
+    def _on_vad_change(self, value: float):
+        """VAD 閾値即時同步到全域變數與設定檔。"""
+        self._vad_val_var.set(f"{value:.2f}")
+        # 同步到 app 模組的 VAD_THRESHOLD
+        import sys as _sys
+        app_module = _sys.modules.get(type(self._app).__module__)
+        if app_module and hasattr(app_module, "VAD_THRESHOLD"):
+            app_module.VAD_THRESHOLD = value   # type: ignore
+        self._app._patch_setting("vad_threshold", round(value, 2))
+
+    # ── 5. 模型路徑 ───────────────────────────────────────────────────
 
     def _build_model_path_section(self):
         ctk.CTkLabel(
@@ -297,7 +347,7 @@ class SettingsTab(ctk.CTkScrollableFrame):
             self._app._patch_setting("model_dir", d)  # type: ignore
         self._model_path_lbl.configure(text=d)
 
-    # ── 5. FFmpeg ─────────────────────────────────────────────────────
+    # ── 6. FFmpeg ─────────────────────────────────────────────────────
 
     def _build_ffmpeg_section(self):
         ctk.CTkLabel(
@@ -346,6 +396,12 @@ class SettingsTab(ctk.CTkScrollableFrame):
         self.chinese_seg.set(
             "簡體中文" if settings.get("output_simplified") else "繁體中文"
         )
+
+        # VAD 閾値
+        vad = float(settings.get("vad_threshold", 0.50))
+        vad = max(0.30, min(0.80, vad))
+        self._vad_slider.set(vad)
+        self._vad_val_var.set(f"{vad:.2f}")
 
         # FFmpeg 狀態
         ffpath = settings.get("ffmpeg_path", "")

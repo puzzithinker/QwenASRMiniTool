@@ -982,8 +982,13 @@ class App(ctk.CTk):
 
     def _apply_ui_prefs(self, settings: dict):
         """主執行緒：根據儲存的偏好設定同步 UI 控件與外觀。"""
+        global VAD_THRESHOLD
         mode = settings.get("appearance_mode", "dark")
         ctk.set_appearance_mode(mode)
+        # VAD 閾值：從設定還原
+        vad = settings.get("vad_threshold")
+        if vad is not None:
+            VAD_THRESHOLD = float(vad)
         if hasattr(self, "_settings_tab"):
             self._settings_tab.sync_prefs(settings)
 

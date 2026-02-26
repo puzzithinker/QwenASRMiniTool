@@ -1149,6 +1149,21 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
             command=self._load_srt_dialog,
         ).pack(side="left", padx=(0, 4), pady=9)
 
+        # ── 新增：純文字輸出 + 分段音訊
+        ctk.CTkButton(
+            bot, text="📄 純文字", width=88, height=36,
+            fg_color="#1A3A2A", hover_color="#245538",
+            font=("Microsoft JhengHei", 12),
+            command=self._export_plain_text,
+        ).pack(side="left", padx=(0, 4), pady=9)
+
+        ctk.CTkButton(
+            bot, text="✂ 分段音訊", width=96, height=36,
+            fg_color="#2A2A1A", hover_color="#404028",
+            font=("Microsoft JhengHei", 12),
+            command=self._export_audio_segments,
+        ).pack(side="left", padx=(0, 4), pady=9)
+
         # ── 右側：取消 + 完成關閉
         ctk.CTkButton(
             bot, text="✖  取消", width=88, height=36,
@@ -1163,6 +1178,100 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
             font=("Microsoft JhengHei", 13, "bold"),
             command=self._save,
         ).pack(side="right", padx=(0, 4), pady=9)
+
+    # ── 輸出功能 ───────────────────────────────────────────
+
+    def _export_plain_text(self):
+        """???字幕所有行的文字，不含時間軸，存為 .txt。"""
+        out_path = filedialog.asksaveasfilename(
+            parent=self,
+            title="儲存純文字",
+            defaultextension=".txt",
+            initialfile=self.srt_path.stem + "_text.txt",
+            filetypes=[("Text Files", "*.txt"), ("所有檔案", "*.*")],
+            initialdir=str(self.srt_path.parent),
+        )
+        if not out_path:
+            return
+        lines: list[str] = []
+        for row in self._rows:
+            text = row["text"].get().strip()
+            if not text:
+                continue
+            # 將每行加回「。」（使繼徜帶標點的语感）
+            spk = row["speaker"].get()
+            if self.has_speakers and spk and spk in self._spk_name_vars:
+                display = self._spk_name_vars[spk].get() or spk
+                text = f"{display}：{text}"
+            lines.append(text)
+        try:
+            Path(out_path).write_text("\n".join(lines), encoding="utf-8")
+            from tkinter import messagebox
+            messagebox.showinfo("已完成", f"純文字已儲存至：\n{out_path}", parent=self)
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror("儲存失敗", str(e), parent=self)
+
+    def _export_audio_segments(self):
+        """???音訊檔依字幕時間軸切残，每段存為獨立 wav。
+        檔名格式： 00001-10000.wav（起始毫秒 - 結束毫秒）。
+        """
+        if self._audio_data is None:
+            from tkinter import messagebox
+            messagebox.showwarning("無音訊", "請先載入音訊檔才能分段輸出。", parent=self)
+            return
+
+        out_dir = filedialog.askdirectory(
+            parent=self, title="選擇分段音訊儲存目錄"
+        )
+        if not out_dir:
+            return
+
+        out_path = Path(out_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+
+        ok = 0
+        errors: list[str] = []
+        for row in self._rows:
+            text = row["text"].get().strip()
+            if not text:
+                continue
+            try:
+                s = self._ts_to_sec(row["start"].get())
+                e = self._ts_to_sec(row["end"].get())
+                if e <= s:
+                    continue
+                si  = max(0, int(s * self._audio_sr))
+                ei  = min(len(self._audio_data), int(e * self._audio_sr))
+                seg = self._audio_data[si:ei]
+                if len(seg) == 0:
+                    continue
+                # 檔名： 00001-10000.wav（20位落小毫秒）
+                s_ms = int(round(s * 1000))
+                e_ms = int(round(e * 1000))
+                fname = f"{s_ms:08d}-{e_ms:08d}.wav"
+
+                try:
+                    import soundfile as sf
+                    sf.write(str(out_path / fname), seg, self._audio_sr, subtype="PCM_16")
+                except ImportError:
+                    import wave, struct
+                    import numpy as np
+                    seg16 = (seg * 32767).clip(-32768, 32767).astype(np.int16)
+                    with wave.open(str(out_path / fname), "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(self._audio_sr)
+                        wf.writeframes(seg16.tobytes())
+                ok += 1
+            except Exception as ex:
+                errors.append(f"{row['start'].get()}: {ex}")
+
+        from tkinter import messagebox
+        msg = f"分段完成：{ok} 個音訊檔 → {out_path}"
+        if errors:
+            msg += f"\n失敗 {len(errors)} 個：\n" + "\n".join(errors[:5])
+        messagebox.showinfo("區段音訊已輸出", msg, parent=self)
 
     # ── 草稿路徑 ─────────────────────────────────────────────────────
 
