@@ -34,6 +34,7 @@ import sys
 import tempfile
 import time
 import threading
+import types
 import queue
 from datetime import datetime
 from pathlib import Path
@@ -81,6 +82,12 @@ MIN_SUB_SEC          = 0.6
 GAP_SEC              = 0.08
 RT_SILENCE_CHUNKS    = 25
 RT_MAX_BUFFER_CHUNKS = 600
+
+# ── 斷句標點集合 ──────────────────────────────────────────
+# 中文子句結束標點（保留於行末後切行）
+_ZH_CLAUSE_END = frozenset('，。？！；：…—、·')
+# 英文句子結束標點
+_EN_SENT_END   = frozenset('.!?;')
 
 
 # ══════════════════════════════════════════════════════
@@ -145,17 +152,56 @@ def _detect_speech_groups(audio: np.ndarray, vad_sess) -> list[tuple[float, floa
 
 
 def _split_to_lines(text: str) -> list[str]:
+    """語意優先斷句（ForcedAligner 不可用時的 fallback）。
+
+    優先順序：
+    1. 標點符號優先切行（標點不保留，從字幕輸出中隱藏）
+    2. 字元數超過 MAX_CHARS 時強制切割（無標點時的保護）
+    3. 英文單字不切斷（整個 word 為最小單位）
+    """
     if not text:
         return []
-    parts = re.split(r"[。！？，、；：…—,.!?;:]+", text)
-    lines = []
-    for p in parts:
-        p = p.strip()
-        if not p:
+
+    _all_punct = _ZH_CLAUSE_END | _EN_SENT_END
+    lines: list[str] = []
+    buf = ""
+
+    i = 0
+    while i < len(text):
+        ch = text[i]
+
+        # ── 標點符號：立即切行，標點不加入輸出（隱藏標點）────────────
+        if ch in _all_punct:
+            if buf.strip():
+                lines.append(buf.strip())
+            buf = ""
+            i += 1
             continue
-        while len(p) > MAX_CHARS:
-            lines.append(p[:MAX_CHARS]); p = p[MAX_CHARS:]
-        lines.append(p)
+
+        # ── 英文單字：整字收集，不在字母中間切斷 ──────────────────
+        if ch.isalpha() and ord(ch) < 128:
+            j = i
+            while j < len(text) and text[j].isalpha() and ord(text[j]) < 128:
+                j += 1
+            word = text[i:j]
+            # 加入後超過上限 → 先把當前 buf 存起來，再開新行
+            if len(buf) + len(word) > MAX_CHARS and buf.strip():
+                lines.append(buf.strip())
+                buf = ""
+            buf += word
+            i = j
+            continue
+
+        buf += ch
+        i += 1
+
+        # ── 字元數上限（無標點時的保護，不截斷英文單字）────────────
+        if len(buf) >= MAX_CHARS:
+            lines.append(buf.strip())
+            buf = ""
+
+    if buf.strip():
+        lines.append(buf.strip())
     return [l for l in lines if l.strip()]
 
 
@@ -197,6 +243,103 @@ def _find_vad_model() -> Path | None:
     return None
 
 
+def _ts_to_subtitle_lines(
+    ts_list,
+    chunk_offset: float,
+    spk: str | None,
+    cc,
+    simplified: bool,
+) -> list[tuple[float, float, str, str | None]]:
+    """ForcedAligner 字元/詞 時間戳記 → 字幕行。
+
+    分行優先順序（兩層）：
+    1. 標點符號優先：，。？！；：…—、. ! ? ; 出現時立即切行，
+       標點本身不加入輸出（隱藏標點，字幕顯示乾淨文字）。
+    2. 字元上限 MAX_CHARS：無標點時的保護性強制切行，
+       英文 token（ForcedAligner 回傳整個單字）不拆斷。
+
+    Args:
+        ts_list:      Qwen3ForcedAligner.align() 回傳的 TimeStamp 物件列表，
+                      每個物件有 .text / .start_time / .end_time（秒，相對 chunk）。
+        chunk_offset: 此 chunk 在整段音訊的絕對起始秒數。
+        spk:          說話者標籤（可為 None）。
+        cc:           OpenCC 轉換器（簡→繁）；simplified=True 時不使用。
+        simplified:   True = 跳過 OpenCC，直接輸出簡體。
+    """
+    _all_punct = _ZH_CLAUSE_END | _EN_SENT_END
+    result: list[tuple[float, float, str, str | None]] = []
+    # buf 只存「非標點」的 token，標點 token 僅用於觸發切行
+    buf: list = []
+    char_count = 0
+    # 記錄最後一個標點 token 的 end_time，作為切行結束時間
+    _last_punct_end: float | None = None
+
+    def _flush(force_end: float | None = None):
+        """將 buf 合併為一行字幕，清空 buf。
+        force_end: 若標點 token 觸發切行，傳入標點的 end_time 作為字幕結束時間。
+        """
+        nonlocal char_count, _last_punct_end
+        if not buf:
+            char_count = 0
+            _last_punct_end = None
+            return
+        start = chunk_offset + buf[0].start_time
+        # 結束時間優先用傳入的 force_end（即標點 token 的 end_time）
+        end = chunk_offset + (force_end if force_end is not None
+                              else buf[-1].end_time)
+        text = "".join(t.text for t in buf)
+        # OpenCC 繁化在整行合併後處理，確保詞組完整轉換
+        if not simplified and cc is not None:
+            text = cc.convert(text)
+        if end > start and text.strip():
+            result.append((start, end, text.strip(), spk))
+        buf.clear()
+        char_count = 0
+        _last_punct_end = None
+
+    for ts in ts_list:
+        ts_text = ts.text or ""
+
+        # ── 標點優先：標點 token 不入 buf，直接觸發切行 ──────────────
+        # 判斷 token 文字去除空白後是否為純標點
+        stripped = ts_text.strip()
+        if stripped and all(c in _all_punct for c in stripped):
+            # 以標點的 end_time 作為前一段字幕的結束時間
+            _flush(force_end=ts.end_time)
+            continue
+
+        ts_len = len(ts_text) if ts_text else 1
+
+        # ── 字元上限保護（無標點時）：英文 token 整字不切斷 ──────────
+        if buf and char_count + ts_len > MAX_CHARS:
+            _flush()
+
+        buf.append(ts)
+        char_count += ts_len
+
+        # ── 同一 token 中含有結尾標點（如中文「你好，」整字回傳）──────
+        # 兼容 ForcedAligner 有時將字符與標點合在同一 token 的情況
+        if stripped and stripped[-1] in _all_punct:
+            # 移除尾部標點後再存入 buf
+            clean_text = stripped.rstrip("".join(_all_punct))
+            if clean_text:
+                # 以替換方式更新剛加入的 token 文字（用 SimpleNamespace 替代）
+                patched = types.SimpleNamespace(
+                    text=clean_text,
+                    start_time=buf[-1].start_time,
+                    end_time=buf[-1].end_time,
+                )
+                buf[-1] = patched
+                char_count = sum(len(t.text or "") for t in buf)
+            else:
+                # token 文字全為標點，從 buf 移除並觸發切行
+                buf.pop()
+            _flush(force_end=ts.end_time)
+
+    _flush()
+    return result
+
+
 # 全域：是否輸出簡體中文（True = 跳過 OpenCC 繁化）
 _g_output_simplified: bool = False
 
@@ -208,16 +351,21 @@ class GPUASREngine:
     """PyTorch 推理引擎。使用 qwen_asr 官方 API，支援 CUDA / CPU。"""
 
     def __init__(self):
-        self.ready      = False
-        self._lock      = threading.Lock()
-        self.vad_sess   = None
-        self.model      = None   # Qwen3ASRModel
-        self.device     = "cpu"
-        self.cc         = None
+        self.ready       = False
+        self._lock       = threading.Lock()
+        self.vad_sess    = None
+        self.model       = None   # Qwen3ASRModel
+        self.aligner     = None   # Qwen3ForcedAligner（可選）
+        self.use_aligner = False  # 是否啟用時間軸對齊
+        self.device      = "cpu"
+        self.cc          = None
         self.diar_engine = None
 
-    def load(self, device: str = "cuda", model_dir: Path = None, cb=None):
-        """從背景執行緒呼叫。device: 'cuda' 或 'cpu'。"""
+    def load(self, device: str = "cuda", model_dir: Path = None,
+             cb=None, use_aligner: bool = True):
+        """從背景執行緒呼叫。device: 'cuda' 或 'cpu'。
+        use_aligner: 是否嘗試載入 Qwen3-ForcedAligner-0.6B 精確時間軸對齊模型。
+        """
         import torch
         import onnxruntime as ort
         import opencc
@@ -226,7 +374,8 @@ class GPUASREngine:
         if model_dir is None:
             model_dir = GPU_MODEL_DIR
 
-        asr_path = model_dir / ASR_MODEL_NAME
+        asr_path     = model_dir / ASR_MODEL_NAME
+        aligner_path = model_dir / ALIGNER_MODEL_NAME
 
         def _s(msg):
             if cb: cb(msg)
@@ -272,9 +421,29 @@ class GPUASREngine:
             dtype=dtype,
         )
 
+        # ── ForcedAligner（可選，需模型目錄存在）────────────────────────
+        self.aligner     = None
+        self.use_aligner = False
+        if use_aligner and aligner_path.exists():
+            try:
+                _s(f"載入時間軸對齊模型（{ALIGNER_MODEL_NAME}）…")
+                from qwen_asr import Qwen3ForcedAligner
+                self.aligner = Qwen3ForcedAligner.from_pretrained(
+                    str(aligner_path),
+                    device_map=self.device,
+                    dtype=dtype,
+                )
+                self.use_aligner = True
+                _s(f"時間軸對齊模型就緒（{device.upper()}）")
+            except Exception as _e:
+                _s(f"⚠ ForcedAligner 載入失敗（{_e}），改用比例估算")
+                self.aligner     = None
+                self.use_aligner = False
+
         self.cc    = opencc.OpenCC("s2twp")
         self.ready = True
-        _s(f"就緒（{device.upper()}  {ASR_MODEL_NAME}）")
+        aligner_info = "  + ForcedAligner" if self.use_aligner else ""
+        _s(f"就緒（{device.upper()}  {ASR_MODEL_NAME}{aligner_info}）")
 
     def transcribe(
         self,
@@ -329,13 +498,47 @@ class GPUASREngine:
             if progress_cb:
                 spk_info = f" [{spk}]" if spk else ""
                 progress_cb(i, total, f"[{i+1}/{total}] {g0:.1f}s~{g1:.1f}s{spk_info}")
-            text = self.transcribe(chunk, language=language, context=context)
-            if not text:
+
+            # ── ASR 轉錄（取簡體原始輸出，對齊後再繁化）─────────────────
+            with self._lock:
+                results = self.model.transcribe(
+                    [(chunk, SAMPLE_RATE)],
+                    language=language,
+                    context=context or "",
+                )
+            raw_text = (results[0].text if results else "").strip()
+            if not raw_text:
                 continue
-            lines = _split_to_lines(text)
-            all_subs.extend(
-                (s, e, line, spk) for s, e, line in _assign_ts(lines, g0, g1)
-            )
+
+            # ── ForcedAligner 精確時間軸對齊 ─────────────────────────────
+            aligned = False
+            if self.use_aligner and self.aligner is not None:
+                try:
+                    # align() 接受 (np.ndarray, sr) tuple，language 用 ISO-like 名稱
+                    align_lang = language or "Chinese"
+                    align_results = self.aligner.align(
+                        audio=(chunk, SAMPLE_RATE),
+                        text=raw_text,
+                        language=align_lang,
+                    )
+                    ts_list = align_results[0] if align_results else []
+                    if ts_list:
+                        subs = _ts_to_subtitle_lines(
+                            ts_list, g0, spk, self.cc, _g_output_simplified
+                        )
+                        if subs:
+                            all_subs.extend(subs)
+                            aligned = True
+                except Exception:
+                    aligned = False  # 靜默 fallback 到比例估算
+
+            if not aligned:
+                # ── 比例估算 Fallback ──────────────────────────────────────
+                text = raw_text if _g_output_simplified else self.cc.convert(raw_text)
+                lines = _split_to_lines(text)
+                all_subs.extend(
+                    (s, e, line, spk) for s, e, line in _assign_ts(lines, g0, g1)
+                )
 
         if not all_subs:
             return None
@@ -596,6 +799,16 @@ class App(ctk.CTk):
         self.n_spk_combo.set("自動")
         self.n_spk_combo.pack(side="left")
 
+        # ── 時間軸對齊 checkbox（ForcedAligner 載入後才啟用）────────────
+        self._align_var = ctk.BooleanVar(value=True)
+        self.align_chk = ctk.CTkCheckBox(
+            row2, text="時間軸對齊",
+            variable=self._align_var,
+            font=FONT_BODY, state="disabled",
+            command=self._on_align_toggle,
+        )
+        self.align_chk.pack(side="left", padx=(18, 0))
+
         hint_hdr = ctk.CTkFrame(parent, fg_color="transparent")
         hint_hdr.pack(fill="x", padx=8, pady=(6, 0))
         ctk.CTkButton(
@@ -829,8 +1042,14 @@ class App(ctk.CTk):
 
     def _load_models(self):
         device = self._get_torch_device()
+        # 讀取使用者是否想啟用 ForcedAligner（在主執行緒 UI 中讀取）
+        use_aligner = getattr(self, "_align_var", None)
+        use_aligner = use_aligner.get() if use_aligner is not None else True
         try:
-            self.engine.load(device=device, model_dir=GPU_MODEL_DIR, cb=self._set_status)
+            self.engine.load(
+                device=device, model_dir=GPU_MODEL_DIR,
+                cb=self._set_status, use_aligner=use_aligner,
+            )
             self.after(0, self._on_models_ready)
         except Exception as e:
             first_line = str(e).splitlines()[0][:140]
@@ -846,6 +1065,13 @@ class App(ctk.CTk):
         self._set_status(f"✅ 就緒（{device_label}）")
         if self.engine.diar_engine and self.engine.diar_engine.ready:
             self.diarize_chk.configure(state="normal")
+        # ForcedAligner checkbox：載入成功 → 啟用；否則 → 停用並取消勾選
+        if hasattr(self, "align_chk"):
+            if self.engine.use_aligner:
+                self.align_chk.configure(state="normal")
+            else:
+                self.align_chk.configure(state="disabled")
+                self._align_var.set(False)
         # 注入引擎到批次 tab
         if hasattr(self, "_batch_tab"):
             self._batch_tab.set_engine(self.engine)
@@ -883,6 +1109,13 @@ class App(ctk.CTk):
     def _on_diarize_toggle(self):
         state = "readonly" if self._diarize_var.get() else "disabled"
         self.n_spk_combo.configure(state=state)
+
+    # ── 時間軸對齊 UI ──────────────────────────────────
+
+    def _on_align_toggle(self):
+        """動態切換 ForcedAligner 啟用狀態（不需重新載入模型）。"""
+        if self.engine.aligner is not None:
+            self.engine.use_aligner = self._align_var.get()
 
     # ── Hint 輸入輔助 ──────────────────────────────────
 
