@@ -570,6 +570,9 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
         "#76D7C4",  # 5 青
     ]
 
+    # 分頁常數：每頁顯示幾行字幕
+    PAGE_SIZE = 20
+
     def __init__(
         self,
         parent,
@@ -585,6 +588,7 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
         self._audio_data: "np.ndarray | None" = None
         self._audio_sr   = 16000
         self._rows: list[dict] = []   # 每條 = {start, end, speaker, text} StringVar
+        self._page: int = 0           # 目前分頁（0-based）
 
         raw = self._parse_srt(srt_path)
         self._all_spk_ids: list[str] = sorted({e["speaker"] for e in raw if e["speaker"]})
@@ -665,6 +669,13 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
             self._build_spk_name_bar()
         self._build_header()
 
+        # ── 分頁導覽列（置於清單上方）────────────────────────────────
+        self._pager_bar = ctk.CTkFrame(self, fg_color=("gray88", "#18182A"),
+                                       corner_radius=0, height=36)
+        self._pager_bar.pack(fill="x", padx=6, pady=(0, 2))
+        self._pager_bar.pack_propagate(False)
+        self._build_pager()
+
         self._sf = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self._sf.pack(fill="both", expand=True, padx=6, pady=(0, 4))
 
@@ -713,20 +724,144 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
                 kw["width"] = w
             ctk.CTkLabel(hdr, **kw).pack(side="left", padx=(4, 0))
 
+    @property
+    def _total_pages(self) -> int:
+        """總頁數（至少 1 頁）。"""
+        return max(1, math.ceil(len(self._rows) / self.PAGE_SIZE))
+
+    def _page_slice(self) -> tuple[int, int]:
+        """回傳目前頁對應的 self._rows 切片範圍 (start, end)。"""
+        s = self._page * self.PAGE_SIZE
+        e = min(s + self.PAGE_SIZE, len(self._rows))
+        return s, e
+
+    def _build_pager(self):
+        """第一次建立分頁 bar 內容（初始化時呼叫一次）。"""
+        bar = self._pager_bar
+        for w in bar.winfo_children():
+            w.destroy()
+
+        # 上頁
+        self._btn_prev = ctk.CTkButton(
+            bar, text="◀ 上頁", width=72, height=26,
+            fg_color="#1A2040", hover_color="#263060",
+            font=("Microsoft JhengHei", 11),
+            command=self._prev_page,
+        )
+        self._btn_prev.pack(side="left", padx=(8, 4), pady=5)
+
+        # 頁碼顯示 + 跳頁輸入
+        self._page_info_var = ctk.StringVar(value="")
+        ctk.CTkLabel(
+            bar, textvariable=self._page_info_var,
+            font=("Microsoft JhengHei", 11),
+            text_color=("gray25", "#8888AA"),
+            width=120, anchor="center",
+        ).pack(side="left", padx=4)
+
+        ctk.CTkLabel(
+            bar, text="跳至：",
+            font=("Microsoft JhengHei", 11),
+            text_color=("gray40", "#555577"),
+        ).pack(side="left", padx=(8, 2))
+
+        self._jump_var = ctk.StringVar(value="")
+        jump_entry = ctk.CTkEntry(
+            bar, textvariable=self._jump_var,
+            width=52, height=26, font=("Consolas", 11), justify="center",
+        )
+        jump_entry.pack(side="left", padx=(0, 4))
+        jump_entry.bind("<Return>", lambda e: self._goto_page())
+
+        ctk.CTkButton(
+            bar, text="Go", width=44, height=26,
+            fg_color="#243030", hover_color="#35484A",
+            font=("Microsoft JhengHei", 11),
+            command=self._goto_page,
+        ).pack(side="left", padx=(0, 12))
+
+        # 下頁
+        self._btn_next = ctk.CTkButton(
+            bar, text="下頁 ▶", width=72, height=26,
+            fg_color="#1A2040", hover_color="#263060",
+            font=("Microsoft JhengHei", 11),
+            command=self._next_page,
+        )
+        self._btn_next.pack(side="left", padx=(0, 8))
+
+        # 行數統計（右側）
+        self._row_count_var = ctk.StringVar(value="")
+        ctk.CTkLabel(
+            bar, textvariable=self._row_count_var,
+            font=("Microsoft JhengHei", 10),
+            text_color=("gray50", "#555566"),
+        ).pack(side="right", padx=(0, 12))
+
+        self._refresh_pager()
+
+    def _refresh_pager(self):
+        """更新分頁 bar 的頁碼文字與按鈕狀態（每次換頁後呼叫）。"""
+        total = self._total_pages
+        # 確保 _page 在合法範圍
+        self._page = max(0, min(self._page, total - 1))
+        s, e = self._page_slice()
+        self._page_info_var.set(f"第 {self._page + 1} / {total} 頁")
+        self._jump_var.set(str(self._page + 1))
+        self._row_count_var.set(
+            f"顯示第 {s + 1}–{e} 行  （共 {len(self._rows)} 行）"
+        )
+        # 上/下頁按鈕啟停
+        self._btn_prev.configure(
+            state="normal" if self._page > 0 else "disabled"
+        )
+        self._btn_next.configure(
+            state="normal" if self._page < total - 1 else "disabled"
+        )
+
+    def _prev_page(self):
+        if self._page > 0:
+            self._page -= 1
+            self._rebuild_rows()
+
+    def _next_page(self):
+        if self._page < self._total_pages - 1:
+            self._page += 1
+            self._rebuild_rows()
+
+    def _goto_page(self):
+        """依跳頁輸入框的值切換頁碼。"""
+        try:
+            target = int(self._jump_var.get()) - 1  # 轉為 0-based
+        except ValueError:
+            return
+        target = max(0, min(target, self._total_pages - 1))
+        if target != self._page:
+            self._page = target
+            self._rebuild_rows()
+
     def _rebuild_rows(self):
+        """重建目前分頁的 widget，並更新分頁導覽列。"""
         for w in self._sf.winfo_children():
             w.destroy()
-        # 在最頂端加「在最前插入」快捷列
-        top_bar = ctk.CTkFrame(self._sf, fg_color=("gray88", "#181828"), corner_radius=4)
-        top_bar.pack(fill="x", padx=2, pady=(0, 2))
-        ctk.CTkButton(
-            top_bar, text="⊕  在最前面插入空白段", width=200, height=24,
-            fg_color="#1B2A1B", hover_color="#253825",
-            font=("Microsoft JhengHei", 11),
-            command=self._insert_at_top,
-        ).pack(side="left", padx=6, pady=3)
-        for i, row in enumerate(self._rows):
-            self._build_one_row(i, row)
+
+        # 只在第一頁頂端顯示「在最前插入」
+        if self._page == 0:
+            top_bar = ctk.CTkFrame(self._sf, fg_color=("gray88", "#181828"), corner_radius=4)
+            top_bar.pack(fill="x", padx=2, pady=(0, 2))
+            ctk.CTkButton(
+                top_bar, text="⊕  在最前面插入空白段", width=200, height=24,
+                fg_color="#1B2A1B", hover_color="#253825",
+                font=("Microsoft JhengHei", 11),
+                command=self._insert_at_top,
+            ).pack(side="left", padx=6, pady=3)
+
+        # 只建立當頁的 widget（降低 widget 數量，避免卡頓）
+        s, e = self._page_slice()
+        for i in range(s, e):
+            self._build_one_row(i, self._rows[i])
+
+        # 更新分頁導覽列
+        self._refresh_pager()
 
     def _build_one_row(self, idx: int, row: dict):
         spk_id = row["speaker"].get()
@@ -887,12 +1022,16 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
             "speaker": ctk.StringVar(value=self._rows[idx]["speaker"].get()),
             "text":    ctk.StringVar(value=""),
         })
+        # 插入後跳到新行所在的頁
+        self._page = (idx + 1) // self.PAGE_SIZE
         self._rebuild_rows()
 
     def _delete(self, idx: int):
         if len(self._rows) <= 1:
             return
         del self._rows[idx]
+        # 刪除後確保頁碼不超出範圍（_refresh_pager 內已做 clamp，但需先更新）
+        self._page = min(self._page, max(0, self._total_pages - 1))
         self._rebuild_rows()
 
     def _insert_at_top(self):
@@ -904,6 +1043,7 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
             "speaker": ctk.StringVar(value=self._rows[0]["speaker"].get() if self._rows else ""),
             "text":    ctk.StringVar(value=""),
         })
+        self._page = 0  # 回到第一頁，讓使用者看到剛插入的行
         self._rebuild_rows()
 
     def _reorder_and_fix(self):
@@ -916,6 +1056,7 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
             s_n  = self._ts_to_sec(self._rows[i + 1]["start"].get())
             if e_i > s_n:
                 self._rows[i]["end"].set(self._sec_to_ts(s_n))
+        self._page = 0  # 排序後回到第一頁
         self._rebuild_rows()
 
     @staticmethod
@@ -1085,6 +1226,7 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
         self._all_spk_ids = new_spk_ids
         self.has_speakers = bool(self._all_spk_ids) and self.diarize_mode
         self._init_rows(raw)
+        self._page = 0  # 載入新字幕時回到第一頁
         self._rebuild_rows()
 
     def _load_srt_dialog(self):
