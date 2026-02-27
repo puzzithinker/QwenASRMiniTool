@@ -1,16 +1,16 @@
 @echo off
 REM =======================================================
-REM  Qwen3 ASR - PyInstaller Build Script (onedir mode)
+REM  逐字稿神器 - PyInstaller Build Script (onedir mode)
 REM
 REM  OUTPUT STRUCTURE:
-REM    dist\QwenASR\
-REM      QwenASR.exe        <- launcher (~5 MB)
+REM    dist\逐字稿神器\
+REM      逐字稿神器.exe     <- launcher (~5 MB)
 REM      prompt_template.json
 REM      _internal\         <- Python runtime + packages
 REM
 REM  DISTRIBUTION:
 REM    Run setup.iss with Inno Setup to produce
-REM    QwenASR_Setup.exe (~400 MB installer).
+REM    逐字稿神器_Setup.exe (~400 MB installer).
 REM    Models (~1.2 GB) are downloaded at first run.
 REM
 REM  STARTUP TIME:
@@ -20,13 +20,10 @@ REM =======================================================
 
 REM Use build_venv (no torch) for smaller output.
 REM Run build_venv.bat first if build_venv\ doesn't exist.
-IF EXIST "F:\AIStudio\QwenASR\build_venv\Scripts\python.exe" (
-    SET VENV=F:\AIStudio\QwenASR\build_venv
-) ELSE (
-    SET VENV=F:\AIStudio\QwenASR\venv
-)
+REM Update the paths below to match your environment
+SET VENV=build_venv
 SET PYTHON=%VENV%\Scripts\python.exe
-SET SRC=F:\AIStudio\QwenASR
+SET SRC=.
 
 echo === Step 1: Install PyInstaller ===
 %PYTHON% -m pip install pyinstaller --quiet
@@ -76,7 +73,7 @@ REM Chinese Windows (cp950 default encoding).
 %PYTHON% -m PyInstaller ^
     --onedir ^
     --windowed ^
-    --name "QwenASR" ^
+    --name "逐字稿神器" ^
     --icon NONE ^
     --add-data "%CTK_DIR%;customtkinter" ^
     --add-data "%OPENCC_DIR%;opencc" ^
@@ -116,15 +113,16 @@ REM Chinese Windows (cp950 default encoding).
     --add-data "%SRC%\ffmpeg_utils.py;." ^
     --add-data "%SRC%\subtitle_editor.py;." ^
     --add-data "%SRC%\setting.py;." ^
+    --add-data "%SRC%\subtitle_formatter.py;." ^
     %SRC%\app.py
 
 echo.
-IF EXIST "%SRC%\dist\QwenASR\QwenASR.exe" (
+IF EXIST "%SRC%\dist\逐字稿神器\逐字稿神器.exe" (
     echo ===================================================
     echo  Build SUCCESS - Copying chatllm DLLs...
     echo ===================================================
 
-    REM Copy chatllm DLLs + main.exe to dist\QwenASR\chatllm\
+    REM Copy chatllm DLLs + main.exe to dist\逐字稿神器\chatllm\
     REM These are needed for Vulkan GPU backend (libchatllm.dll, ggml-vulkan.dll, etc.)
     REM  libchatllm.dll  - newly built (2026-02-23), supports ASR models
     REM  ggml-vulkan.dll - Vulkan GPU backend (52 MB shader kernels)
@@ -132,44 +130,44 @@ IF EXIST "%SRC%\dist\QwenASR\QwenASR.exe" (
     REM  main.exe        - used for --show_devices GPU detection only
 
     IF EXIST "%SRC%\chatllm" (
-        xcopy "%SRC%\chatllm\libchatllm.dll"         "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml.dll"               "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-base.dll"          "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-alderlake.dll" "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-haswell.dll"   "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-icelake.dll"   "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-sandybridge.dll" "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-skylakex.dll"  "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-sse42.dll"     "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-x64.dll"       "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-rpc.dll"           "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-vulkan.dll"        "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\libcrypto-1_1-x64.dll"  "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\libssl-1_1-x64.dll"     "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\vulkan-1.dll"            "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\main.exe"               "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        echo  chatllm/    : DLLs copied to dist\QwenASR\chatllm\
+        xcopy "%SRC%\chatllm\libchatllm.dll"         "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\ggml.dll"               "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\ggml-base.dll"          "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\ggml-cpu-alderlake.dll" "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\ggml-cpu-haswell.dll"   "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\ggml-cpu-icelake.dll"   "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\ggml-cpu-sandybridge.dll" "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\ggml-cpu-skylakex.dll"  "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\ggml-cpu-sse42.dll"     "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\ggml-cpu-x64.dll"       "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\ggml-rpc.dll"           "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\ggml-vulkan.dll"        "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\libcrypto-1_1-x64.dll"  "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\libssl-1_1-x64.dll"    "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\vulkan-1.dll"            "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        xcopy "%SRC%\chatllm\main.exe"               "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
+        echo  chatllm/    : DLLs copied to dist\逐字稿神器\chatllm\
     ) ELSE (
         echo  WARNING: chatllm\ not found - GPU backend will not be available
         echo  Copy chatllm DLLs to %SRC%\chatllm\ before building.
     )
 
     echo.
-    REM Copy bundled ffmpeg.exe to dist\QwenASR\ffmpeg\
+    REM Copy bundled ffmpeg.exe to dist\逐字稿神器\ffmpeg\
     REM ffmpeg_utils.find_ffmpeg() searches <exe_dir>/ffmpeg/ffmpeg.exe first
     REM when running as a frozen EXE (sys.frozen=True).
     IF EXIST "%SRC%\ffmpeg\ffmpeg.exe" (
-        IF NOT EXIST "%SRC%\dist\QwenASR\ffmpeg\" mkdir "%SRC%\dist\QwenASR\ffmpeg\"
-        xcopy "%SRC%\ffmpeg\ffmpeg.exe" "%SRC%\dist\QwenASR\ffmpeg\" /Y /Q
-        echo  ffmpeg/     : ffmpeg.exe copied to dist\QwenASR\ffmpeg\
+        IF NOT EXIST "%SRC%\dist\逐字稿神器\ffmpeg\" mkdir "%SRC%\dist\逐字稿神器\ffmpeg\"
+        xcopy "%SRC%\ffmpeg\ffmpeg.exe" "%SRC%\dist\逐字稿神器\ffmpeg\" /Y /Q
+        echo  ffmpeg/     : ffmpeg.exe copied to dist\逐字稿神器\ffmpeg\
     ) ELSE (
         echo  WARNING: ffmpeg\ffmpeg.exe not found - users will be prompted to download at runtime
     )
 
-    echo  Launcher : dist\QwenASR\QwenASR.exe
-    echo  Runtime  : dist\QwenASR\_internal\
-    echo  GPU DLLs : dist\QwenASR\chatllm\   (~71 MB, Vulkan backend)
-    echo  ffmpeg   : dist\QwenASR\ffmpeg\ffmpeg.exe  (video support)
+    echo  Launcher : dist\逐字稿神器\逐字稿神器.exe
+    echo  Runtime  : dist\逐字稿神器\_internal\
+    echo  GPU DLLs : dist\逐字稿神器\chatllm\   (~71 MB, Vulkan backend)
+    echo  ffmpeg   : dist\逐字稿神器\ffmpeg\ffmpeg.exe  (video support)
     echo  WebUI    : use app-gpu.py (start-gpu.bat) for Streamlit service
     echo.
     echo  Model downloaded at first run from:
@@ -177,7 +175,7 @@ IF EXIST "%SRC%\dist\QwenASR\QwenASR.exe" (
     echo  Saved to: {app}\GPUModel\qwen3-asr-1.7b.bin  (~2.3 GB)
     echo.
     echo  Next step: open setup.iss with Inno Setup
-    echo  to produce QwenASR_Setup.exe for distribution.
+    echo  to produce 逐字稿神器_Setup.exe for distribution.
     echo ===================================================
 ) ELSE (
     echo ===================================================

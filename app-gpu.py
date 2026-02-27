@@ -1,5 +1,5 @@
 """
-Qwen3 ASR 字幕生成器 - GPU 版本（PyTorch 版本）
+逐字稿神器 - GPU 版本（PyTorch 版本）
 
 推理後端：PyTorch (CUDA / CPU)，使用 Qwen3-ASR-1.7B
 模型路徑：GPUModel/Qwen3-ASR-1.7B
@@ -51,6 +51,12 @@ try:
 except ImportError:
     _SUBTITLE_EDITOR_AVAILABLE = False
     SubtitleEditorWindow = None
+
+# ── 字幕格式化模組 ─────────────────────────────────────────────────────
+from subtitle_formatter import (
+    SubtitleFormat, format_timestamp, write_subtitle_file,
+    format_to_string, string_to_format
+)
 
 # ── 路徑 ──────────────────────────────────────────────
 BASE_DIR        = Path(__file__).parent
@@ -214,16 +220,6 @@ def _split_to_lines(text: str) -> list[str]:
     if buf.strip():
         lines.append(buf.strip())
     return [l for l in lines if l.strip()]
-
-
-
-def _srt_ts(s: float) -> str:
-    ms = int(round(s * 1000))
-    hh = ms // 3_600_000; ms %= 3_600_000
-    mm = ms // 60_000;    ms %= 60_000
-    ss = ms // 1_000;     ms %= 1_000
-    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
-
 
 def _assign_ts(lines: list[str], g0: float, g1: float) -> list[tuple[float, float, str]]:
     if not lines:
@@ -603,15 +599,18 @@ class GPUASREngine:
         if not all_subs:
             return None
 
-        if progress_cb:
-            progress_cb(total, total, "寫入 SRT…")
+        # 取得輸出格式設定
+        settings = self._load_settings() if hasattr(self, '_load_settings') else {}
+        format_str = settings.get("output_format", "txt")
+        sub_format = string_to_format(format_str)
 
+        if progress_cb:
+            progress_cb(total, total, f"寫入 {sub_format.value.upper()}…")
+
+        # 使用統一格式化模組
         out = SRT_DIR / (audio_path.stem + ".srt")
-        with open(out, "w", encoding="utf-8") as f:
-            for idx, (s, e, line, spk) in enumerate(all_subs, 1):
-                prefix = f"{spk}：" if spk else ""
-                f.write(f"{idx}\n{_srt_ts(s)} --> {_srt_ts(e)}\n{prefix}{line}\n\n")
-        return out
+        actual_path = write_subtitle_file(all_subs, out, sub_format)
+        return actual_path
 
 
 # ══════════════════════════════════════════════════════
@@ -712,7 +711,7 @@ class App(ctk.CTk):
 
     def __init__(self):
         super().__init__()
-        self.title("Qwen3 ASR 字幕生成器 [GPU]")
+        self.title("逐字稿神器 [GPU]")
         self.geometry("960x700")
         self.minsize(800, 580)
 
@@ -742,7 +741,7 @@ class App(ctk.CTk):
         title_bar.pack(fill="x")
         title_bar.pack_propagate(False)
         ctk.CTkLabel(
-            title_bar, text="  🎙 Qwen3 ASR 字幕生成器  ⚡ GPU",
+            title_bar, text="  🎙 逐字稿神器  ⚡ GPU",
             font=FONT_TITLE, anchor="w"
         ).pack(side="left", padx=16, pady=8)
 
@@ -1040,10 +1039,15 @@ class App(ctk.CTk):
         try:
             if SETTINGS_FILE.exists():
                 with open(SETTINGS_FILE, encoding="utf-8") as f:
-                    return json.load(f)
+                    settings = json.load(f)
+                    # 確保預設格式為 txt
+                    if "output_format" not in settings:
+                        settings["output_format"] = "txt"
+                    return settings
         except Exception:
             pass
-        return {}
+        # 回傳預設設定
+        return {"output_format": "txt"}
 
     def _save_settings(self, settings: dict):
         try:
@@ -1453,13 +1457,23 @@ class App(ctk.CTk):
             messagebox.showinfo("提示", "目前沒有字幕內容可儲存"); return
         ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = SRT_DIR / f"realtime_{ts}.srt"
-        t   = 0.0
-        with open(out, "w", encoding="utf-8") as f:
-            for idx, line in enumerate(self._rt_log, 1):
-                end = t + 5.0
-                f.write(f"{idx}\n{_srt_ts(t)} --> {_srt_ts(end)}\n{line}\n\n")
-                t = end + 0.1
-        messagebox.showinfo("儲存完成", f"已儲存至：\n{out}")
+        
+        # 取得輸出格式設定
+        settings = self._load_settings()
+        format_str = settings.get("output_format", "txt")
+        sub_format = string_to_format(format_str)
+        
+        # 建立條目列表
+        entries = []
+        t = 0.0
+        for line in self._rt_log:
+            end = t + 5.0
+            entries.append((t, end, line, None))
+            t = end + 0.1
+        
+        # 使用統一格式化模組
+        actual_path = write_subtitle_file(entries, out, sub_format)
+        messagebox.showinfo("儲存完成", f"已儲存至：\n{actual_path}")
         os.startfile(str(SRT_DIR))
 
     # ── 字幕驗證 ──────────────────────────────────────

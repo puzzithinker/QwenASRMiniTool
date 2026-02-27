@@ -1,5 +1,5 @@
 """
-chatllm_engine.py — ChatLLM.cpp + Vulkan 推理後端
+chatllm_engine.py — ChatLLM.cpp + Vulkan 推理後端 (逐字稿神器)
 
 兩種執行模式：
   1. DLL 模式（優先）：ctypes 直接呼叫 libchatllm.dll，模型常駐記憶體
@@ -22,6 +22,12 @@ import time
 from pathlib import Path
 
 import numpy as np
+
+# ── 字幕格式化模組 ─────────────────────────────────────────────────────
+from subtitle_formatter import (
+    SubtitleFormat, format_timestamp, write_subtitle_file,
+    format_to_string, string_to_format
+)
 
 # ── 輸出語系旗標（由 app.py / app-gpu.py 切換時同步設定）──────────────
 # True = 直接輸出模型原始簡體；False = 經 OpenCC s2twp 轉為繁體
@@ -541,15 +547,6 @@ def _split_to_lines(text: str) -> list[str]:
         lines.append(p)
     return [l for l in lines if l.strip()]
 
-
-def _srt_ts(s: float) -> str:
-    ms = int(round(s * 1000))
-    hh = ms // 3_600_000; ms %= 3_600_000
-    mm = ms // 60_000;    ms %= 60_000
-    ss = ms // 1_000;     ms %= 1_000
-    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
-
-
 def _assign_ts(lines: list[str], g0: float, g1: float) -> list[tuple[float, float, str]]:
     if not lines:
         return []
@@ -768,6 +765,7 @@ class ChatLLMASREngine:
         context:    str | None = None,
         diarize:    bool = False,
         n_speakers: int | None = None,
+        output_format: str = "txt",
     ) -> Path | None:
         import librosa
 
@@ -810,16 +808,17 @@ class ChatLLMASREngine:
         if not all_subs:
             return None
 
-        if progress_cb:
-            progress_cb(total, total, "寫入 SRT…")
+        # 解析輸出格式
+        sub_format = string_to_format(output_format)
 
+        if progress_cb:
+            progress_cb(total, total, f"寫入 {sub_format.value.upper()}…")
+
+        # 使用統一格式化模組
         SRT_DIR.mkdir(exist_ok=True)
         out = SRT_DIR / (audio_path.stem + ".srt")
-        with open(out, "w", encoding="utf-8") as f:
-            for idx, (s, e, line, spk) in enumerate(all_subs, 1):
-                prefix = f"{spk}：" if spk else ""
-                f.write(f"{idx}\n{_srt_ts(s)} --> {_srt_ts(e)}\n{prefix}{line}\n\n")
-        return out
+        actual_path = write_subtitle_file(all_subs, out, sub_format)
+        return actual_path
 
     def __del__(self):
         pass   # DLL runner 由 GC 自然回收（ctypes callback 會被 GC 清理）

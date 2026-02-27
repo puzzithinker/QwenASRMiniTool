@@ -4,10 +4,10 @@ REM  Create a minimal build venv WITHOUT torch/transformers
 REM  to reduce the final EXE package size.
 REM
 REM  Run this ONCE before running build.bat.
-REM  This will create F:\AIStudio\QwenASR\build_venv\
+REM  This will create build_venv\ in the current directory
 REM =======================================================
 
-SET BASE=F:\AIStudio\QwenASR
+SET BASE=.
 SET BVENV=%BASE%\build_venv
 
 echo === Creating minimal build venv (no torch) ===

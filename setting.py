@@ -1,11 +1,12 @@
-"""setting.py — 獨立設定 Tab
+"""setting.py — 獨立設定 Tab (逐字稿神器)
 
 SettingsTab(CTkScrollableFrame) 整合：
   1. Streamlit 服務控制（show_service=True 時顯示）
   2. 外觀主題
   3. 中文輸出語言
-  4. 模型路徑
-  5. FFmpeg 路徑
+  4. 字幕輸出格式（TXT/SRT）
+  5. 模型路徑
+  6. FFmpeg 路徑
 
 使用方式（app.py）：
     from setting import SettingsTab
@@ -95,6 +96,9 @@ class SettingsTab(ctk.CTkScrollableFrame):
         _hsep(self)
 
         self._build_language_section()
+        _hsep(self)
+
+        self._build_output_format_section()
         _hsep(self)
 
         self._build_vad_section()
@@ -249,7 +253,36 @@ class SettingsTab(ctk.CTkScrollableFrame):
         mapped = "簡體" if "簡" in value else "繁體"
         self._app._on_chinese_mode_change(mapped)
 
-    # ── 4. VAD 語音偵測阈値 ─────────────────────────────
+    # ── 4. 字幕輸出格式 ───────────────────────────────────────────────
+
+    def _build_output_format_section(self):
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=(10, 8))
+
+        ctk.CTkLabel(
+            row, text="📝 輸出格式", font=FONT_BODY, width=130, anchor="w",
+        ).pack(side="left")
+
+        self.format_seg = ctk.CTkSegmentedButton(
+            row, values=["TXT 格式", "SRT 格式"],
+            width=200, height=30, font=FONT_BODY,
+            command=self._on_format_seg,
+        )
+        self.format_seg.set("TXT 格式")
+        self.format_seg.pack(side="left")
+
+        # 提示標籤
+        ctk.CTkLabel(
+            row, text="（預設為 TXT 格式）", font=FONT_SMALL,
+            text_color=("gray50", "gray60"),
+        ).pack(side="left", padx=(12, 0))
+
+    def _on_format_seg(self, value: str):
+        """輸出格式切換回調"""
+        format_value = "txt" if "TXT" in value else "srt"
+        self._app._patch_setting("output_format", format_value)
+
+    # ── 5. VAD 語音偵測阈値 ─────────────────────────────
 
     def _build_vad_section(self):
         ctk.CTkLabel(
@@ -296,7 +329,7 @@ class SettingsTab(ctk.CTkScrollableFrame):
             app_module.VAD_THRESHOLD = value   # type: ignore
         self._app._patch_setting("vad_threshold", round(value, 2))
 
-    # ── 5. 模型路徑 ───────────────────────────────────────────────────
+    # ── 6. 模型路徑 ───────────────────────────────────────────────────
 
     def _build_model_path_section(self):
         ctk.CTkLabel(
@@ -347,7 +380,7 @@ class SettingsTab(ctk.CTkScrollableFrame):
             self._app._patch_setting("model_dir", d)  # type: ignore
         self._model_path_lbl.configure(text=d)
 
-    # ── 6. FFmpeg ─────────────────────────────────────────────────────
+    # ── 7. FFmpeg ─────────────────────────────────────────────────────
 
     def _build_ffmpeg_section(self):
         ctk.CTkLabel(
@@ -396,6 +429,10 @@ class SettingsTab(ctk.CTkScrollableFrame):
         self.chinese_seg.set(
             "簡體中文" if settings.get("output_simplified") else "繁體中文"
         )
+
+        # 輸出格式
+        output_format = settings.get("output_format", "txt")
+        self.format_seg.set("TXT 格式" if output_format == "txt" else "SRT 格式")
 
         # VAD 閾値
         vad = float(settings.get("vad_threshold", 0.50))

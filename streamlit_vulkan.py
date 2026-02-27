@@ -1,5 +1,5 @@
 """
-Qwen3 ASR 字幕生成器 - Streamlit Web 前端
+逐字稿神器 - Streamlit Web 前端
 Glass Morphism Dark UI | PyTorch CUDA / CPU 推理
 
 啟動：python -m streamlit run streamlit_app.py
@@ -18,9 +18,15 @@ from datetime import datetime
 import numpy as np
 import streamlit as st
 
+# ── 字幕格式化模組 ─────────────────────────────────────────────────────
+from subtitle_formatter import (
+    SubtitleFormat, format_timestamp, write_subtitle_file,
+    format_to_string, string_to_format
+)
+
 # ── Page config（必須是第一個 Streamlit 呼叫）─────────────
 st.set_page_config(
-    page_title="Qwen3 ASR",
+    page_title="逐字稿神器",
     page_icon="🎙",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -332,15 +338,6 @@ def _split_to_lines(text: str) -> list[str]:
         lines.append(p)
     return [l for l in lines if l.strip()]
 
-
-def _srt_ts(s: float) -> str:
-    ms = int(round(s * 1000))
-    hh = ms // 3_600_000; ms %= 3_600_000
-    mm = ms // 60_000;    ms %= 60_000
-    ss = ms // 1_000;     ms %= 1_000
-    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
-
-
 def _assign_ts(lines, g0, g1):
     if not lines:
         return []
@@ -476,11 +473,30 @@ def _process_file(eng: dict, audio_path: Path,
     if not all_subs:
         return None
 
-    srt_lines = []
-    for idx, (s, e, line, spk) in enumerate(all_subs, 1):
-        prefix = f"{spk}：" if spk else ""
-        srt_lines.append(f"{idx}\n{_srt_ts(s)} --> {_srt_ts(e)}\n{prefix}{line}\n")
-    return "\n".join(srt_lines)
+    # 取得輸出格式設定（從 session state）
+    output_format = st.session_state.get("output_format", "txt")
+    sub_format = string_to_format(output_format)
+    
+    # 使用統一格式化模組
+    from io import StringIO
+    output = StringIO()
+    
+    if sub_format == SubtitleFormat.TXT:
+        # TXT 格式
+        for s, e, line, spk in all_subs:
+            prefix = f"{spk}: " if spk else ""
+            start_ts = format_timestamp(s, use_dot=True)
+            end_ts = format_timestamp(e, use_dot=True)
+            output.write(f"[{start_ts} --> {end_ts}]  {prefix}{line}\n\n")
+    else:
+        # SRT 格式
+        for idx, (s, e, line, spk) in enumerate(all_subs, 1):
+            prefix = f"{spk}：" if spk else ""
+            start_ts = format_timestamp(s, use_dot=False)
+            end_ts = format_timestamp(e, use_dot=False)
+            output.write(f"{idx}\n{start_ts} --> {end_ts}\n{prefix}{line}\n\n")
+    
+    return output.getvalue()
 
 
 # ══════════════════════════════════════════════════════════
@@ -495,7 +511,7 @@ def _render_sidebar(eng: dict | None, err: str | None):
   <div style="font-size:1.15rem; font-weight:700;
               background: linear-gradient(90deg, #7dd3fc, #a5b4fc);
               -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
-    Qwen3 ASR
+    逐字稿神器
   </div>
   <div style="font-size:0.72rem; color:rgba(148,163,184,0.6);
               margin-top:2px; letter-spacing:0.5px;">
@@ -564,6 +580,17 @@ def _render_sidebar(eng: dict | None, err: str | None):
             help="強制指定辨識語言，自動偵測適合多語混合音訊",
         )
 
+        # 輸出格式選擇
+        output_format = st.selectbox(
+            "輸出格式",
+            options=["TXT ([timestamp] text)", "SRT (傳統字幕格式)"],
+            index=0,
+            help="TXT 為新格式 [00:00:00.000 --> 00:00:04.400] 文字，SRT 為傳統字幕格式",
+        )
+        
+        # 儲存到 session state
+        st.session_state["output_format"] = "txt" if "TXT" in output_format else "srt"
+
         st.divider()
 
         # 說話者分離
@@ -592,7 +619,7 @@ def _render_sidebar(eng: dict | None, err: str | None):
         st.markdown(
             '<div style="color:rgba(100,116,139,0.5); font-size:0.7rem; '
             'text-align:center; line-height:1.6;">'
-            'Qwen3-ASR-1.7B<br>OpenVINO VAD · OpenCC s2twp'
+            '逐字稿神器<br>Qwen3-ASR-1.7B · OpenVINO VAD · OpenCC s2twp'
             '</div>', unsafe_allow_html=True
         )
 
@@ -812,18 +839,32 @@ def _tab_realtime(eng: dict | None):
             st.rerun()
     with col_act2:
         if log:
-            # 組成 SRT
-            srt_lines = []
+            # 取得輸出格式設定
+            output_format = st.session_state.get("output_format", "txt")
+            sub_format = string_to_format(output_format)
+            
+            # 組成字幕內容
+            lines = []
             for idx, (ts, text) in enumerate(log, 1):
                 start = (idx - 1) * 5.0
                 end   = start + 5.0
-                srt_lines.append(f"{idx}\n{_srt_ts(start)} --> {_srt_ts(end)}\n{text}\n")
-            srt_bytes = "\n".join(srt_lines).encode("utf-8")
+                if sub_format == SubtitleFormat.TXT:
+                    start_ts = format_timestamp(start, use_dot=True)
+                    end_ts = format_timestamp(end, use_dot=True)
+                    lines.append(f"[{start_ts} --> {end_ts}]  {text}")
+                else:
+                    start_ts = format_timestamp(start, use_dot=False)
+                    end_ts = format_timestamp(end, use_dot=False)
+                    lines.append(f"{idx}\n{start_ts} --> {end_ts}\n{text}")
+            
+            content = "\n\n".join(lines) if sub_format == SubtitleFormat.TXT else "\n\n".join(lines) + "\n"
+            content_bytes = content.encode("utf-8")
             ts_now = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ext = sub_format.value
             st.download_button(
-                "💾 下載 SRT",
-                data=srt_bytes,
-                file_name=f"realtime_{ts_now}.srt",
+                f"💾 下載 {ext.upper()}",
+                data=content_bytes,
+                file_name=f"realtime_{ts_now}.{ext}",
                 mime="text/plain",
                 use_container_width=True,
             )

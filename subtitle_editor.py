@@ -6,7 +6,8 @@
 設計原則：
   - 與推理後端完全解耦（只需 audio ndarray + sr）
   - SubtitleDetailEditor：時間軸視覺化 + 拖曳調整 + 段落播放
-  - SubtitleEditorWindow：逐條驗證、草稿暫存、SRT 輸出
+  - SubtitleEditorWindow：逐條驗證、草稿暫存、SRT/TXT 輸出
+  - 支援 TXT 與 SRT 雙格式
 """
 from __future__ import annotations
 
@@ -20,6 +21,12 @@ from tkinter import filedialog, messagebox
 
 import numpy as np
 import customtkinter as ctk
+
+# ── 字幕格式化模組 ─────────────────────────────────────────────────────
+from subtitle_formatter import (
+    SubtitleFormat, format_timestamp, parse_subtitle_file,
+    format_to_string, string_to_format
+)
 
 # ── 字型常數（與 app.py / app-gpu.py 保持一致）────────────────────────
 FONT_MONO = ("Consolas", 12)
@@ -590,7 +597,7 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
         self._rows: list[dict] = []   # 每條 = {start, end, speaker, text} StringVar
         self._page: int = 0           # 目前分頁（0-based）
 
-        raw = self._parse_srt(srt_path)
+        raw = self._parse_subtitle(srt_path)
         self._all_spk_ids: list[str] = sorted({e["speaker"] for e in raw if e["speaker"]})
         self.has_speakers = bool(self._all_spk_ids) and diarize_mode
 
@@ -608,9 +615,30 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
         # 視窗渲染完成後再偵測草稿
         self.after(200, self._check_draft)
 
-    # ── SRT 解析 ─────────────────────────────────────────────────────
+    # ── 字幕解析（支援 SRT 與 TXT 格式）────────────────────────────────
 
-    def _parse_srt(self, path: Path) -> list[dict]:
+    def _parse_subtitle(self, path: Path) -> list[dict]:
+        """解析字幕檔案（支援 TXT 和 SRT 格式）"""
+        try:
+            entries = parse_subtitle_file(path)
+            out: list[dict] = []
+            for s, e, text, speaker in entries:
+                # 轉換時間戳格式
+                start_ts = format_timestamp(s, use_dot=False)
+                end_ts = format_timestamp(e, use_dot=False)
+                out.append({
+                    "start": start_ts,
+                    "end": end_ts,
+                    "speaker": speaker or "",
+                    "text": text,
+                })
+            return out
+        except Exception:
+            # 如果新解析器失敗，回退到舊的 SRT 解析
+            return self._parse_srt_legacy(path)
+
+    def _parse_srt_legacy(self, path: Path) -> list[dict]:
+        """舊版 SRT 解析（向後相容）"""
         text   = path.read_text(encoding="utf-8")
         blocks = re.split(r"\n\s*\n", text.strip())
         out: list[dict] = []
@@ -1279,21 +1307,47 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
     def _draft_path(self) -> Path:
         return self.srt_path.parent / f"{self.srt_path.stem}_draft.srt"
 
-    # ── SRT 寫入（暫存與最終共用）────────────────────────────────────
+    # ── 字幕寫入（暫存與最終共用，支援 SRT 與 TXT 格式）────────────────
 
-    def _write_srt(self, path: Path):
+    def _write_subtitle(self, path: Path, format_type: SubtitleFormat = SubtitleFormat.SRT):
+        """寫入字幕檔案，支援 SRT 與 TXT 格式"""
         with open(path, "w", encoding="utf-8") as f:
-            for i, row in enumerate(self._rows, 1):
-                start = row["start"].get()
-                end   = row["end"].get()
-                text  = row["text"].get().strip()
-                spk   = row["speaker"].get()
-                if self.has_speakers and spk and spk in self._spk_name_vars:
-                    display = self._spk_name_vars[spk].get() or spk
-                    prefix  = f"{display}："
-                else:
-                    prefix = ""
-                f.write(f"{i}\n{start} --> {end}\n{prefix}{text}\n\n")
+            if format_type == SubtitleFormat.TXT:
+                # TXT 格式: [00:00:00.000 --> 00:00:04.400]  Speaker: text
+                for row in self._rows:
+                    start = row["start"].get()
+                    end   = row["end"].get()
+                    text  = row["text"].get().strip()
+                    spk   = row["speaker"].get()
+                    
+                    # 轉換時間戳格式 (逗號改為點號)
+                    start_ts = start.replace(",", ".")
+                    end_ts = end.replace(",", ".")
+                    
+                    # 處理說話者前綴
+                    if self.has_speakers and spk and spk in self._spk_name_vars:
+                        display = self._spk_name_vars[spk].get() or spk
+                        prefix = f"{display}: "
+                    else:
+                        prefix = ""
+                    
+                    f.write(f"[{start_ts} --> {end_ts}]  {prefix}{text}\n\n")
+            else:
+                # SRT 格式（傳統）
+                for i, row in enumerate(self._rows, 1):
+                    start = row["start"].get()
+                    end   = row["end"].get()
+                    text  = row["text"].get().strip()
+                    spk   = row["speaker"].get()
+                    if self.has_speakers and spk and spk in self._spk_name_vars:
+                        display = self._spk_name_vars[spk].get() or spk
+                        prefix  = f"{display}："
+                    else:
+                        prefix = ""
+                    f.write(f"{i}\n{start} --> {end}\n{prefix}{text}\n\n")
+
+    # 向後相容的別名
+    _write_srt = _write_subtitle
 
     # ── 暫存 ─────────────────────────────────────────────────────────
 
@@ -1321,10 +1375,10 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
 
     # ── 載入字幕 ─────────────────────────────────────────────────────
 
-    def _load_srt_file(self, path: Path):
-        """解析並載入任意 SRT 檔案，保留說話者命名對應。"""
+    def _load_subtitle_file(self, path: Path):
+        """解析並載入任意字幕檔案（支援 SRT 和 TXT），保留說話者命名對應。"""
         try:
-            raw = self._parse_srt(path)
+            raw = self._parse_subtitle(path)
         except Exception as e:
             messagebox.showerror("載入失敗", str(e), parent=self)
             return
@@ -1338,17 +1392,25 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
         self._page = 0  # 載入新字幕時回到第一頁
         self._rebuild_rows()
 
+    # 向後相容的別名
+    _load_srt_file = _load_subtitle_file
+
     def _load_srt_dialog(self):
-        """開啟檔案對話框，選擇要載入的 SRT。"""
+        """開啟檔案對話框，選擇要載入的字幕檔（支援 SRT 與 TXT）。"""
         path = filedialog.askopenfilename(
             parent=self,
             title="選擇要載入的字幕檔",
-            filetypes=[("SRT 字幕", "*.srt"), ("所有檔案", "*.*")],
+            filetypes=[
+                ("字幕檔案", "*.srt *.txt"),
+                ("SRT 字幕", "*.srt"),
+                ("TXT 字幕", "*.txt"),
+                ("所有檔案", "*.*")
+            ],
             initialdir=str(self.srt_path.parent),
         )
         if not path:
             return
-        self._load_srt_file(Path(path))
+        self._load_subtitle_file(Path(path))
         self._draft_status_var.set(f"已載入 {Path(path).name}")
 
     # ── 音訊控制與關閉 ───────────────────────────────────────────────
@@ -1383,12 +1445,21 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
         self.destroy()
 
     def _save(self):
-        """完成確認，儲存為最終 _edited_<時間戳>.srt，刪除草稿，關閉視窗。"""
+        """完成確認，儲存為最終 _edited_<時間戳>.srt/txt，刪除草稿，關閉視窗。"""
         self._stop_audio()
         ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = self.srt_path.parent / f"{self.srt_path.stem}_edited_{ts}.srt"
+        
+        # 根據原始檔案副檔名決定輸出格式
+        original_ext = self.srt_path.suffix.lower()
+        if original_ext == ".txt":
+            out_path = self.srt_path.parent / f"{self.srt_path.stem}_edited_{ts}.txt"
+            sub_format = SubtitleFormat.TXT
+        else:
+            out_path = self.srt_path.parent / f"{self.srt_path.stem}_edited_{ts}.srt"
+            sub_format = SubtitleFormat.SRT
+        
         try:
-            self._write_srt(out_path)
+            self._write_subtitle(out_path, sub_format)
         except Exception as e:
             messagebox.showerror("儲存失敗", str(e), parent=self)
             return

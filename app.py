@@ -1,8 +1,8 @@
 """
-Qwen3 ASR 字幕生成器 - CustomTkinter 前端
+逐字稿神器 - CustomTkinter 前端
 
 功能：
-  1. 音檔上傳 → SRT 字幕（支援 OpenVINO CPU / GPU）
+  1. 音檔上傳 → TXT/SRT 字幕（支援 OpenVINO CPU / GPU）
   2. 即時轉換：偵測音訊輸入裝置，邊說邊顯示字幕
 """
 from __future__ import annotations
@@ -45,6 +45,12 @@ except Exception:
     _CHATLLM_AVAILABLE = False
     ChatLLMASREngine   = None
     def detect_vulkan_devices(_): return []
+
+# ── 字幕格式化模組 ─────────────────────────────────────────────────────
+from subtitle_formatter import (
+    SubtitleFormat, format_timestamp, write_subtitle_file,
+    format_to_string, string_to_format
+)
 
 # ── 路徑 ──────────────────────────────────────────────
 # PyInstaller 凍結時，模型應放在 EXE 旁邊（非 _internal/）
@@ -206,15 +212,6 @@ def _split_to_lines(text: str) -> list[str]:
     if buf.strip():
         lines.append(buf.strip())
     return [l for l in lines if l.strip()]
-
-
-
-def _srt_ts(s: float) -> str:
-    ms = int(round(s * 1000))
-    hh = ms // 3_600_000; ms %= 3_600_000
-    mm = ms // 60_000;    ms %= 60_000
-    ss = ms // 1_000;     ms %= 1_000
-    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
 
 
 def _assign_ts(lines: list[str], g0: float, g1: float) -> list[tuple[float, float, str]]:
@@ -445,15 +442,18 @@ class ASREngine:
         if not all_subs:
             return None
 
+        # 取得輸出格式設定
+        settings = self._load_settings() if hasattr(self, '_load_settings') else {}
+        format_str = settings.get("output_format", "txt")
+        sub_format = string_to_format(format_str)
+        
         if progress_cb:
-            progress_cb(total, total, "寫入 SRT…")
+            progress_cb(total, total, f"寫入 {sub_format.value.upper()}…")
 
+        # 使用統一格式化模組
         out = SRT_DIR / (audio_path.stem + ".srt")
-        with open(out, "w", encoding="utf-8") as f:
-            for idx, (s, e, line, spk) in enumerate(all_subs, 1):
-                prefix = f"{spk}：" if spk else ""
-                f.write(f"{idx}\n{_srt_ts(s)} --> {_srt_ts(e)}\n{prefix}{line}\n\n")
-        return out
+        actual_path = write_subtitle_file(all_subs, out, sub_format)
+        return actual_path
 
 
 # ══════════════════════════════════════════════════════
@@ -719,7 +719,7 @@ class App(ctk.CTk):
 
     def __init__(self):
         super().__init__()
-        self.title("Qwen3 ASR 字幕生成器")
+        self.title("逐字稿神器")
         self.geometry("960x700")
         self.minsize(800, 580)
 
@@ -753,7 +753,7 @@ class App(ctk.CTk):
         title_bar.pack(fill="x")
         title_bar.pack_propagate(False)
         ctk.CTkLabel(
-            title_bar, text="  🎙 Qwen3 ASR 字幕生成器",
+            title_bar, text="  🎙 逐字稿神器",
             font=FONT_TITLE, anchor="w"
         ).pack(side="left", padx=16, pady=8)
 
@@ -1206,10 +1206,15 @@ class App(ctk.CTk):
         try:
             if SETTINGS_FILE.exists():
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    settings = json.load(f)
+                    # 確保預設格式為 txt
+                    if "output_format" not in settings:
+                        settings["output_format"] = "txt"
+                    return settings
         except Exception:
             pass
-        return {}
+        # 回傳預設設定
+        return {"output_format": "txt"}
 
     def _save_settings(self, settings: dict):
         """儲存完整設定 dict 到 settings.json。
@@ -1220,6 +1225,7 @@ class App(ctk.CTk):
           model_dir     : OpenVINO 模型資料夾
           model_path    : chatllm .bin 模型路徑（chatllm 後端用）
           chatllm_dir   : chatllm DLL 目錄
+          output_format : "txt" | "srt"  (字幕輸出格式，預設 txt)
         """
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -1360,7 +1366,7 @@ class App(ctk.CTk):
         chosen[0] = 選定設定 dict（或 None 表示取消）。
         """
         dlg = ctk.CTkToplevel(self)
-        dlg.title("QwenASR 初始設定")
+        dlg.title("逐字稿神器 - 初始設定")
         dlg.resizable(False, False)
         dlg.grab_set()
         dlg.focus_set()
@@ -1408,7 +1414,7 @@ class App(ctk.CTk):
 
         # ── 標題 ──────────────────────────────────────────────────────
         ctk.CTkLabel(
-            scroll, text="🎙  QwenASR 初始設定",
+            scroll, text="🎙  逐字稿神器 - 初始設定",
             font=("Microsoft JhengHei", 18, "bold"), anchor="w",
         ).pack(fill="x", padx=24, pady=(20, 4))
 
@@ -1598,7 +1604,7 @@ class App(ctk.CTk):
                             from downloader import _ssl_ctx
                             req = urllib.request.Request(
                                 url,
-                                headers={"User-Agent": "Mozilla/5.0 (compatible; QwenASR)"}
+                                headers={"User-Agent": "Mozilla/5.0 (compatible; 逐字稿神器)"}
                             )
                             with urllib.request.urlopen(req, context=_ssl_ctx()) as resp, \
                                  open(str(bin_dest) + ".tmp", "wb") as out:
@@ -1727,7 +1733,7 @@ class App(ctk.CTk):
                            "/resolve/main/qwen3-asr-1.7b.bin")
                     model_path.parent.mkdir(parents=True, exist_ok=True)
                     req = urllib.request.Request(
-                        url, headers={"User-Agent": "Mozilla/5.0 (compatible; QwenASR)"}
+                        url, headers={"User-Agent": "Mozilla/5.0 (compatible; 逐字稿神器)"}
                     )
                     with urllib.request.urlopen(req, context=_ssl_ctx()) as resp, \
                          open(str(model_path) + ".tmp", "wb") as out:
@@ -2262,13 +2268,23 @@ class App(ctk.CTk):
             return
         ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = SRT_DIR / f"realtime_{ts}.srt"
-        t   = 0.0
-        with open(out, "w", encoding="utf-8") as f:
-            for idx, line in enumerate(self._rt_log, 1):
-                end = t + 5.0
-                f.write(f"{idx}\n{_srt_ts(t)} --> {_srt_ts(end)}\n{line}\n\n")
-                t = end + 0.1
-        messagebox.showinfo("儲存完成", f"已儲存至：\n{out}")
+        
+        # 取得輸出格式設定
+        settings = self._load_settings()
+        format_str = settings.get("output_format", "txt")
+        sub_format = string_to_format(format_str)
+        
+        # 建立條目列表
+        entries = []
+        t = 0.0
+        for line in self._rt_log:
+            end = t + 5.0
+            entries.append((t, end, line, None))
+            t = end + 0.1
+        
+        # 使用統一格式化模組
+        actual_path = write_subtitle_file(entries, out, sub_format)
+        messagebox.showinfo("儲存完成", f"已儲存至：\n{actual_path}")
         os.startfile(str(SRT_DIR))
 
     # ── 關閉處理 ───────────────────────────────────────
