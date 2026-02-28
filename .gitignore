@@ -44,11 +44,12 @@ subtitles/
 *.srt
 installer/
 
-# ── 所有 BAT 檔預設忽略，以下三個除外 ───────────────────
+# ── 所有 BAT 檔預設忽略，以下四個除外 ───────────────────
 *.bat
 !build.bat
 !build_venv.bat
 !start-gpu.bat
+!download_chatllm.bat
 
 # ── 開發/測試用腳本（保留 test_*.py 以便追蹤測試）──────────────
 benchmark.py
