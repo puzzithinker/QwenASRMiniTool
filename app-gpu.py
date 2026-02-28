@@ -58,6 +58,17 @@ from subtitle_formatter import (
     format_to_string, string_to_format
 )
 
+# ── Shared ASR utilities (single source of truth) ──────────────────────
+from asr_common import (
+    SAMPLE_RATE, VAD_CHUNK, MAX_GROUP_SEC, MAX_CHARS, MIN_SUB_SEC, GAP_SEC,
+    RT_SILENCE_CHUNKS, RT_MAX_BUFFER_CHUNKS, PUNCT_ALL,
+    detect_speech_groups, split_to_lines, assign_timestamps,
+    get_vad_threshold, set_vad_threshold,
+    get_output_simplified, set_output_simplified,
+    set_srt_dir,
+)
+from engine_base import ASREngineBase
+
 # ── 路徑 ──────────────────────────────────────────────
 BASE_DIR        = Path(__file__).parent
 GPU_MODEL_DIR   = BASE_DIR / "GPUModel"
@@ -65,6 +76,7 @@ OV_MODEL_DIR    = BASE_DIR / "ov_models"      # 借用 CPU 版的 VAD 模型
 SETTINGS_FILE   = BASE_DIR / "settings-gpu.json"
 SRT_DIR         = BASE_DIR / "subtitles"
 SRT_DIR.mkdir(exist_ok=True)
+set_srt_dir(SRT_DIR)
 
 ASR_MODEL_NAME      = "Qwen3-ASR-1.7B"
 ALIGNER_MODEL_NAME  = "Qwen3-ForcedAligner-0.6B"
@@ -77,165 +89,6 @@ SUPPORTED_LANGUAGES = [
     "Dutch", "Swedish", "Danish", "Finnish", "Polish", "Czech",
     "Filipino", "Persian", "Greek", "Romanian", "Hungarian", "Macedonian",
 ]
-
-# ── 常數 ──────────────────────────────────────────────
-SAMPLE_RATE          = 16000
-VAD_CHUNK            = 512
-VAD_THRESHOLD        = 0.5
-MAX_GROUP_SEC        = 20
-MAX_CHARS            = 20
-MIN_SUB_SEC          = 0.6
-GAP_SEC              = 0.08
-RT_SILENCE_CHUNKS    = 25
-RT_MAX_BUFFER_CHUNKS = 600
-
-# ── 斷句標點集合 ──────────────────────────────────────────
-# 中文子句結束標點（不保留，切行後隱藏）
-_ZH_CLAUSE_END = frozenset('，。？！；：…—、·')
-# 英文子句結束標點（含逗號，讓英文逗號也觸發切行）
-_EN_SENT_END   = frozenset('.,!?;')
-
-
-# ══════════════════════════════════════════════════════
-# 共用工具函式（與 app.py 相同）
-# ══════════════════════════════════════════════════════
-
-def _detect_speech_groups(audio: np.ndarray, vad_sess) -> list[tuple[float, float, np.ndarray]]:
-    """Silero VAD 分段，回傳 [(start_s, end_s, chunk), ...]"""
-    h  = np.zeros((2, 1, 64), dtype=np.float32)
-    c  = np.zeros((2, 1, 64), dtype=np.float32)
-    sr = np.array(SAMPLE_RATE, dtype=np.int64)
-    n  = len(audio) // VAD_CHUNK
-    probs = []
-    for i in range(n):
-        chunk = audio[i*VAD_CHUNK:(i+1)*VAD_CHUNK].astype(np.float32)[np.newaxis, :]
-        out, h, c = vad_sess.run(None, {"input": chunk, "h": h, "c": c, "sr": sr})
-        probs.append(float(out[0, 0]))
-    if not probs:
-        return [(0.0, len(audio) / SAMPLE_RATE, audio)]
-
-    MIN_CH = 16; PAD = 5; MERGE = 16
-    raw: list[tuple[int, int]] = []
-    in_sp = False; s0 = 0
-    for i, p in enumerate(probs):
-        if p >= VAD_THRESHOLD and not in_sp:
-            s0 = i; in_sp = True
-        elif p < VAD_THRESHOLD and in_sp:
-            if i - s0 >= MIN_CH:
-                raw.append((max(0, s0-PAD), min(n, i+PAD)))
-            in_sp = False
-    if in_sp and n - s0 >= MIN_CH:
-        raw.append((max(0, s0-PAD), n))
-    if not raw:
-        return []
-
-    merged = [list(raw[0])]
-    for s, e in raw[1:]:
-        if s - merged[-1][1] <= MERGE:
-            merged[-1][1] = e
-        else:
-            merged.append([s, e])
-
-    mx_samp = MAX_GROUP_SEC * SAMPLE_RATE
-    groups: list[tuple[int, int]] = []
-    gs = merged[0][0] * VAD_CHUNK
-    ge = merged[0][1] * VAD_CHUNK
-    for seg in merged[1:]:
-        s = seg[0] * VAD_CHUNK; e = seg[1] * VAD_CHUNK
-        if e - gs > mx_samp:
-            groups.append((gs, ge)); gs = s
-        ge = e
-    groups.append((gs, ge))
-
-    result = []
-    for gs, ge in groups:
-        ns = max(1, int((ge - gs) // SAMPLE_RATE))
-        ch = audio[gs: gs + ns * SAMPLE_RATE].astype(np.float32)
-        if len(ch) < SAMPLE_RATE:
-            continue
-        result.append((gs / SAMPLE_RATE, gs / SAMPLE_RATE + ns, ch))
-    return result
-
-
-def _split_to_lines(text: str) -> list[str]:
-    """語意優先斷句（ForcedAligner 不可用時的 fallback）。
-
-    斷句規則（英文/中文統一）：
-    1. 所有標點（,.!?; 及中文，。？！）→ 立即切行，標點不輸出
-    2. 英文整字為最小單位，詞間保留空格
-    3. MAX_CHARS 保護：超限才強制換行
-    """
-    if not text:
-        return []
-
-    _all_punct = _ZH_CLAUSE_END | _EN_SENT_END  # 含逗號
-    lines: list[str] = []
-    buf = ""
-
-    i = 0
-    while i < len(text):
-        ch = text[i]
-
-        # ── 標點符號：切行，標點不加入輸出（隱藏）────────────────────
-        if ch in _all_punct:
-            if buf.strip():
-                lines.append(buf.strip())
-            buf = ""
-            i += 1
-            continue
-
-        # ── 英文單字：整字收集，詞前補空格（詞界）────────────────────
-        if ch.isalpha() and ord(ch) < 128:
-            j = i
-            while j < len(text) and text[j].isalpha() and ord(text[j]) < 128:
-                j += 1
-            word = text[i:j]
-            # buf 非空且未以空格結尾 → 補一個分詞空格
-            prefix = " " if buf and not buf.endswith(" ") else ""
-            if len(buf) + len(prefix) + len(word) > MAX_CHARS and buf.strip():
-                lines.append(buf.strip())
-                buf = word
-            else:
-                buf += prefix + word
-            i = j
-            continue
-
-        # ── 空格：只在 buf 有內容且未以空格結尾時記錄 ────────────────
-        if ch == " ":
-            if buf and not buf.endswith(" "):
-                buf += " "
-            i += 1
-            if len(buf.rstrip()) >= MAX_CHARS:
-                lines.append(buf.strip())
-                buf = ""
-            continue
-
-        # ── 中文/日文/數字等：逐字累積 ────────────────────────────────
-        buf += ch
-        i += 1
-        if len(buf) >= MAX_CHARS:
-            lines.append(buf.strip())
-            buf = ""
-
-    if buf.strip():
-        lines.append(buf.strip())
-    return [l for l in lines if l.strip()]
-
-def _assign_ts(lines: list[str], g0: float, g1: float) -> list[tuple[float, float, str]]:
-    if not lines:
-        return []
-    total = sum(len(l) for l in lines)
-    if total == 0:
-        return []
-    dur = g1 - g0; res = []; cur = g0
-    for i, line in enumerate(lines):
-        end = cur + max(MIN_SUB_SEC, dur * len(line) / total)
-        if i == len(lines) - 1:
-            end = max(end, g1)
-        res.append((cur, end, line))
-        cur = end + GAP_SEC
-    return res
-
 
 def _find_vad_model() -> Path | None:
     """依序在 GPUModel/ 和 ov_models/ 尋找 Silero VAD ONNX。"""
@@ -275,7 +128,7 @@ def _ts_to_subtitle_lines(
       - MAX_WORDS 保護（英文以詞數限制，中文以字數限制）
     ──────────────────────────────────────────────────────────────────
     """
-    _all_punct = _ZH_CLAUSE_END | _EN_SENT_END  # 含英文逗號
+    _all_punct = PUNCT_ALL
     result: list[tuple[float, float, str, str | None]] = []
 
     # ── 以 raw_text 為藍本，提取「詞序列」（去掉標點，保留空格詞界）──
@@ -394,27 +247,20 @@ def _rebuild_text_with_spaces(raw_chars: list[str]) -> str:
 
 
 
-# 全域：是否輸出簡體中文（True = 跳過 OpenCC 繁化）
-
-_g_output_simplified: bool = False
 
 # ══════════════════════════════════════════════════════
 # GPU ASR 引擎
 # ══════════════════════════════════════════════════════
 
-class GPUASREngine:
+class GPUASREngine(ASREngineBase):
     """PyTorch 推理引擎。使用 qwen_asr 官方 API，支援 CUDA / CPU。"""
 
     def __init__(self):
-        self.ready       = False
-        self._lock       = threading.Lock()
-        self.vad_sess    = None
+        super().__init__()
         self.model       = None   # Qwen3ASRModel
         self.aligner     = None   # Qwen3ForcedAligner（可選）
         self.use_aligner = False  # 是否啟用時間軸對齊
         self.device      = "cpu"
-        self.cc          = None
-        self.diar_engine = None
 
     def load(self, device: str = "cuda", model_dir: Path = None,
              cb=None, use_aligner: bool = True):
@@ -515,102 +361,56 @@ class GPUASREngine:
                 context=context or "",
             )
             text = (results[0].text if results else "").strip()
-            return text if _g_output_simplified else self.cc.convert(text)
+            return text if get_output_simplified() else self.cc.convert(text)
 
-    def process_file(
+    def _process_chunk(
         self,
-        audio_path: Path,
-        progress_cb=None,
-        language: str | None = None,
-        context: str | None = None,
-        diarize: bool = False,
-        n_speakers: int | None = None,
-    ) -> Path | None:
-        """音檔 → SRT，回傳 SRT 路徑。"""
-        import librosa
-        audio, _ = librosa.load(str(audio_path), sr=SAMPLE_RATE, mono=True)
+        chunk: np.ndarray,
+        g0: float,
+        g1: float,
+        spk: str | None,
+        language: str | None,
+        context: str | None,
+    ) -> list[tuple[float, float, str, str | None]]:
+        """Process chunk with ForcedAligner timestamps when available."""
+        # ── ASR 轉錄（取簡體原始輸出，對齊後再繁化）─────────────────
+        with self._lock:
+            results = self.model.transcribe(
+                [(chunk, SAMPLE_RATE)],
+                language=language,
+                context=context or "",
+            )
+        raw_text = (results[0].text if results else "").strip()
+        if not raw_text:
+            return []
 
-        use_diar = diarize and self.diar_engine is not None and self.diar_engine.ready
-        if use_diar:
-            diar_segs = self.diar_engine.diarize(audio, n_speakers=n_speakers)
-            if not diar_segs:
-                return None
-            groups_spk = [
-                (t0, t1,
-                 audio[int(t0 * SAMPLE_RATE): int(t1 * SAMPLE_RATE)],
-                 spk)
-                for t0, t1, spk in diar_segs
-            ]
-        else:
-            vad_groups = _detect_speech_groups(audio, self.vad_sess)
-            if not vad_groups:
-                return None
-            groups_spk = [(g0, g1, chunk, None) for g0, g1, chunk in vad_groups]
-
-        all_subs: list[tuple[float, float, str, str | None]] = []
-        total = len(groups_spk)
-        for i, (g0, g1, chunk, spk) in enumerate(groups_spk):
-            if progress_cb:
-                spk_info = f" [{spk}]" if spk else ""
-                progress_cb(i, total, f"[{i+1}/{total}] {g0:.1f}s~{g1:.1f}s{spk_info}")
-
-            # ── ASR 轉錄（取簡體原始輸出，對齊後再繁化）─────────────────
-            with self._lock:
-                results = self.model.transcribe(
-                    [(chunk, SAMPLE_RATE)],
-                    language=language,
-                    context=context or "",
+        # ── ForcedAligner 精確時間軸對齊 ─────────────────────────
+        if self.use_aligner and self.aligner is not None:
+            try:
+                align_lang = language or "Chinese"
+                align_results = self.aligner.align(
+                    audio=(chunk, SAMPLE_RATE),
+                    text=raw_text,
+                    language=align_lang,
                 )
-            raw_text = (results[0].text if results else "").strip()
-            if not raw_text:
-                continue
-
-            # ── ForcedAligner 精確時間軸對齊 ─────────────────────────────
-            aligned = False
-            if self.use_aligner and self.aligner is not None:
-                try:
-                    # align() 接受 (np.ndarray, sr) tuple，language 用 ISO-like 名稱
-                    align_lang = language or "Chinese"
-                    align_results = self.aligner.align(
-                        audio=(chunk, SAMPLE_RATE),
-                        text=raw_text,
-                        language=align_lang,
+                ts_list = align_results[0] if align_results else []
+                if ts_list:
+                    subs = _ts_to_subtitle_lines(
+                        ts_list, raw_text, g0, spk,
+                        self.cc, get_output_simplified()
                     )
-                    ts_list = align_results[0] if align_results else []
-                    if ts_list:
-                        subs = _ts_to_subtitle_lines(
-                            ts_list, raw_text, g0, spk,
-                            self.cc, _g_output_simplified
-                        )
-                        if subs:
-                            all_subs.extend(subs)
-                            aligned = True
-                except Exception:
-                    aligned = False  # 靜默 fallback 到比例估算
+                    if subs:
+                        return subs
+            except Exception:
+                pass  # 靜默 fallback 到比例估算
 
-            if not aligned:
-                # ── 比例估算 Fallback ──────────────────────────────────────
-                text = raw_text if _g_output_simplified else self.cc.convert(raw_text)
-                lines = _split_to_lines(text)
-                all_subs.extend(
-                    (s, e, line, spk) for s, e, line in _assign_ts(lines, g0, g1)
-                )
-
-        if not all_subs:
-            return None
-
-        # 取得輸出格式設定
-        settings = self._load_settings() if hasattr(self, '_load_settings') else {}
-        format_str = settings.get("output_format", "txt")
-        sub_format = string_to_format(format_str)
-
-        if progress_cb:
-            progress_cb(total, total, f"寫入 {sub_format.value.upper()}…")
-
-        # 使用統一格式化模組
-        out = SRT_DIR / (audio_path.stem + ".srt")
-        actual_path = write_subtitle_file(all_subs, out, sub_format)
-        return actual_path
+        # ── 比例估算 Fallback ────────────────────────────────────────
+        text = raw_text if get_output_simplified() else self.cc.convert(raw_text)
+        lines = split_to_lines(text)
+        return [
+            (s, e, line, spk)
+            for s, e, line in assign_timestamps(lines, g0, g1)
+        ]
 
 
 # ══════════════════════════════════════════════════════
@@ -675,7 +475,7 @@ class RealtimeManager:
             )
             prob = float(out[0, 0])
 
-            if prob >= VAD_THRESHOLD:
+            if prob >= get_vad_threshold():
                 buf.append(chunk); sil = 0
             elif buf:
                 buf.append(chunk); sil += 1
@@ -1064,21 +864,19 @@ class App(ctk.CTk):
 
     def _apply_ui_prefs(self, settings: dict):
         """主執行緒：根據儲存的偏好設定同步 UI 控件與外觀。"""
-        global VAD_THRESHOLD
         mode = settings.get("appearance_mode", "dark")
         ctk.set_appearance_mode(mode)
         # VAD 閾值：從設定還原
         vad = settings.get("vad_threshold")
         if vad is not None:
-            VAD_THRESHOLD = float(vad)
+            set_vad_threshold(float(vad))
         if hasattr(self, "_settings_tab"):
             self._settings_tab.sync_prefs(settings)
 
     def _on_chinese_mode_change(self, value: str):
         """輸出模式切換：繁體（OpenCC）or 簡體（直接輸出）。"""
-        global _g_output_simplified
-        _g_output_simplified = (value == "簡體")
-        self._patch_setting("output_simplified", _g_output_simplified)
+        set_output_simplified(value == "簡體")
+        self._patch_setting("output_simplified", get_output_simplified())
 
     def _on_appearance_change(self, value: str):
         """主題切換：深色 🌑 or 淺色 ☀。"""
@@ -1089,8 +887,7 @@ class App(ctk.CTk):
     def _startup_check(self):
         """背景執行緒：套用 UI 偏好 → 檢查模型存在 → 載入。"""
         settings = self._load_settings()
-        global _g_output_simplified
-        _g_output_simplified = settings.get("output_simplified", False)
+        set_output_simplified(settings.get("output_simplified", False))
         self.after(0, lambda s=settings: self._apply_ui_prefs(s))
 
         asr_path = GPU_MODEL_DIR / ASR_MODEL_NAME

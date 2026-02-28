@@ -52,6 +52,16 @@ from subtitle_formatter import (
     format_to_string, string_to_format
 )
 
+# ── Shared ASR utilities (single source of truth) ──────────────────────
+from asr_common import (
+    SAMPLE_RATE, VAD_CHUNK, MAX_GROUP_SEC, MAX_CHARS, MIN_SUB_SEC, GAP_SEC,
+    RT_SILENCE_CHUNKS, RT_MAX_BUFFER_CHUNKS,
+    get_vad_threshold, set_vad_threshold,
+    get_output_simplified, set_output_simplified,
+    set_srt_dir,
+)
+from engine_base import ASREngineBase
+
 # ── 路徑 ──────────────────────────────────────────────
 # PyInstaller 凍結時，模型應放在 EXE 旁邊（非 _internal/）
 if getattr(sys, "frozen", False):
@@ -71,188 +81,25 @@ _BIN_PATH          = next(
     BASE_DIR / "GPUModel" / "qwen3-asr-1.7b.bin",  # 預設（未下載時）
 )
 SRT_DIR.mkdir(exist_ok=True)
+set_srt_dir(SRT_DIR)
 
-# ── 常數 ────────# 常數
-SAMPLE_RATE   = 16000
-VAD_CHUNK     = 512
-VAD_THRESHOLD = 0.5   # 可由設定頁調整（降低可減少掴字）
-MAX_GROUP_SEC = 20
-MAX_CHARS     = 20
-MIN_SUB_SEC   = 0.6
-GAP_SEC       = 0.08
-
-RT_SILENCE_CHUNKS    = 25   # ~0.8s 靜音後觸發轉錄
-RT_MAX_BUFFER_CHUNKS = 600  # ~19s 上限強制轉錄
-
-
-# ══════════════════════════════════════════════════════
-# 共用工具函式
-# ══════════════════════════════════════════════════════
-
-def _detect_speech_groups(audio: np.ndarray, vad_sess, max_group_sec: int = MAX_GROUP_SEC) -> list[tuple[float, float, np.ndarray]]:
-    """Silero VAD 分段，回傳 [(start_s, end_s, chunk), ...]"""
-    h  = np.zeros((2, 1, 64), dtype=np.float32)
-    c  = np.zeros((2, 1, 64), dtype=np.float32)
-    sr = np.array(SAMPLE_RATE, dtype=np.int64)
-    n  = len(audio) // VAD_CHUNK
-    probs = []
-    for i in range(n):
-        chunk = audio[i*VAD_CHUNK:(i+1)*VAD_CHUNK].astype(np.float32)[np.newaxis, :]
-        out, h, c = vad_sess.run(None, {"input": chunk, "h": h, "c": c, "sr": sr})
-        probs.append(float(out[0, 0]))
-    if not probs:
-        return [(0.0, len(audio) / SAMPLE_RATE, audio)]
-
-    MIN_CH = 16; PAD = 5; MERGE = 16
-    raw: list[tuple[int, int]] = []
-    in_sp = False; s0 = 0
-    for i, p in enumerate(probs):
-        if p >= VAD_THRESHOLD and not in_sp:
-            s0 = i; in_sp = True
-        elif p < VAD_THRESHOLD and in_sp:
-            if i - s0 >= MIN_CH:
-                raw.append((max(0, s0-PAD), min(n, i+PAD)))
-            in_sp = False
-    if in_sp and n - s0 >= MIN_CH:
-        raw.append((max(0, s0-PAD), n))
-    if not raw:
-        return []
-
-    merged = [list(raw[0])]
-    for s, e in raw[1:]:
-        if s - merged[-1][1] <= MERGE:
-            merged[-1][1] = e
-        else:
-            merged.append([s, e])
-
-    mx_samp = max_group_sec * SAMPLE_RATE
-    groups: list[tuple[int, int]] = []
-    gs = merged[0][0] * VAD_CHUNK
-    ge = merged[0][1] * VAD_CHUNK
-    for seg in merged[1:]:
-        s = seg[0] * VAD_CHUNK; e = seg[1] * VAD_CHUNK
-        if e - gs > mx_samp:
-            groups.append((gs, ge)); gs = s
-        ge = e
-    groups.append((gs, ge))
-
-    result = []
-    for gs, ge in groups:
-        ns = max(1, int((ge - gs) // SAMPLE_RATE))
-        ch = audio[gs: gs + ns * SAMPLE_RATE].astype(np.float32)
-        if len(ch) < SAMPLE_RATE:
-            continue
-        result.append((gs / SAMPLE_RATE, gs / SAMPLE_RATE + ns, ch))
-    return result
-
-
-def _split_to_lines(text: str) -> list[str]:
-    """以標點符號切分短句，移除標點，每句獨立成行。
-
-    斷句規則（英文/中文統一）：
-    1. 所有標點（,.!?;: 及中文，。？！；：…—）→ 立即切行，標點不輸出
-    2. 英文整字為最小單位，詞前補空格（詞界）
-    3. MAX_CHARS 保護：超限才強制換行
-    """
-    if "<asr_text>" in text:
-        text = text.split("<asr_text>", 1)[1]
-    text = text.strip()
-    if not text:
-        return []
-
-    # 中文、英文標點統一觸發切行（含英文逗號）
-    PUNCT = frozenset('，。？！；：…—、.,!?;:')
-    lines: list[str] = []
-    buf   = ""
-
-    i = 0
-    while i < len(text):
-        ch = text[i]
-
-        # ── 標點符號：切行，標點不加入輸出（隱藏）────────────────────
-        if ch in PUNCT:
-            if buf.strip():
-                lines.append(buf.strip())
-            buf = ""
-            i += 1
-            continue
-
-        # ── 英文單字：整字收集，詞前補空格（詞界）────────────────────
-        if ch.isalpha() and ord(ch) < 128:
-            j = i
-            while j < len(text) and text[j].isalpha() and ord(text[j]) < 128:
-                j += 1
-            word = text[i:j]
-            prefix = " " if buf and not buf.endswith(" ") else ""
-            if len(buf) + len(prefix) + len(word) > MAX_CHARS and buf.strip():
-                lines.append(buf.strip())
-                buf = word
-            else:
-                buf += prefix + word
-            i = j
-            continue
-
-        # ── 空格：保留分詞間距 ────────────────────────────────────────
-        if ch == " ":
-            if buf and not buf.endswith(" "):
-                buf += " "
-            i += 1
-            if len(buf.rstrip()) >= MAX_CHARS:
-                lines.append(buf.strip())
-                buf = ""
-            continue
-
-        # ── 中文/日文/數字等：逐字累積 ────────────────────────────────
-        buf += ch
-        i += 1
-        if len(buf) >= MAX_CHARS:
-            lines.append(buf.strip())
-            buf = ""
-
-    if buf.strip():
-        lines.append(buf.strip())
-    return [l for l in lines if l.strip()]
-
-
-def _assign_ts(lines: list[str], g0: float, g1: float) -> list[tuple[float, float, str]]:
-    if not lines:
-        return []
-    total = sum(len(l) for l in lines)
-    if total == 0:
-        return []
-    dur = g1 - g0; res = []; cur = g0
-    for i, line in enumerate(lines):
-        end = cur + max(MIN_SUB_SEC, dur * len(line) / total)
-        if i == len(lines) - 1:
-            end = max(end, g1)
-        res.append((cur, end, line))
-        cur = end + GAP_SEC
-    return res
-
-
-# 全域：是否輸出簡體中文（True = 跳過 OpenCC 繁化）
-_g_output_simplified: bool = False
 
 # ══════════════════════════════════════════════════════
 # ASR 引擎
 # ══════════════════════════════════════════════════════
 
-class ASREngine:
+class ASREngine(ASREngineBase):
     """封裝所有模型。transcribe() 加互斥鎖，多執行緒安全。"""
 
     max_chunk_secs: int = 30   # 每段最長音訊（秒），子類別可覆寫
 
     def __init__(self):
-        self.ready       = False
-        self._lock       = threading.Lock()
-        self.vad_sess    = None
+        super().__init__()
         self.audio_enc   = None
         self.embedder    = None
         self.dec_req     = None
         self.processor   = None   # LightProcessor（不含 torch）
         self.pad_id      = None
-        self.cc          = None
-        self.diar_engine = None   # DiarizationEngine（可選）
 
     def load(self, device: str = "CPU", model_dir: Path = None, cb=None):
         """從背景執行緒呼叫。cb(msg) 用於更新 UI 狀態。"""
@@ -353,107 +200,7 @@ class ASREngine:
             if "<asr_text>" in raw:
                 raw = raw.split("<asr_text>", 1)[1]
             text = raw.strip()
-            return text if _g_output_simplified else self.cc.convert(text)
-
-    def _enforce_chunk_limit(
-        self,
-        groups: list[tuple[float, float, np.ndarray, "str | None"]],
-    ) -> list[tuple[float, float, np.ndarray, "str | None"]]:
-        """將超過 max_chunk_secs 的音訊段落切分為等長子片段。
-
-        不論是說話者分離路徑或 VAD 單段路徑，都可能產生比模型
-        輸入長度（max_chunk_secs）更長的 chunk。若不切分，
-        _extract_mel() 會靜默截斷尾段，造成掉字。
-        """
-        max_samples = self.max_chunk_secs * SAMPLE_RATE
-        result = []
-        for t0, t1, chunk, spk in groups:
-            if len(chunk) <= max_samples:
-                result.append((t0, t1, chunk, spk))
-            else:
-                pos = 0
-                while pos < len(chunk):
-                    piece = chunk[pos: pos + max_samples]
-                    if len(piece) < SAMPLE_RATE:   # 不足 1 秒的殘餘片段跳過
-                        break
-                    piece_t0 = t0 + pos / SAMPLE_RATE
-                    piece_t1 = min(t1, piece_t0 + len(piece) / SAMPLE_RATE)
-                    result.append((piece_t0, piece_t1, piece, spk))
-                    pos += max_samples
-        return result
-
-    def process_file(
-        self,
-        audio_path: Path,
-        progress_cb=None,
-        language: str | None = None,
-        context: str | None = None,
-        diarize: bool = False,
-        n_speakers: int | None = None,
-    ) -> Path | None:
-        """音檔 → SRT，回傳 SRT 路徑。
-        language   : 強制語系（如 "Chinese"），None 表示自動偵測
-        context    : 辨識提示（歌詞/關鍵字），放入 system message
-        diarize    : True 時用說話者分離取代 VAD，SRT 加說話者前綴
-        n_speakers : 指定說話者人數（None=自動偵測）
-        """
-        import librosa
-        audio, _ = librosa.load(str(audio_path), sr=SAMPLE_RATE, mono=True)
-
-        # ── 分段策略：說話者分離 vs 傳統 VAD ─────────────────────────
-        # groups_spk: [(g0_sec, g1_sec, audio_chunk, speaker_label | None), ...]
-        use_diar = diarize and self.diar_engine is not None and self.diar_engine.ready
-        if use_diar:
-            diar_segs = self.diar_engine.diarize(audio, n_speakers=n_speakers)
-            if not diar_segs:
-                return None
-            groups_spk = [
-                (t0, t1,
-                 audio[int(t0 * SAMPLE_RATE): int(t1 * SAMPLE_RATE)],
-                 spk)
-                for t0, t1, spk in diar_segs
-            ]
-        else:
-            vad_groups = _detect_speech_groups(audio, self.vad_sess, self.max_chunk_secs)
-            if not vad_groups:
-                return None
-            groups_spk = [(g0, g1, chunk, None) for g0, g1, chunk in vad_groups]
-
-        # 強制切分超過 max_chunk_secs 的片段（兩條路徑都需要）
-        groups_spk = self._enforce_chunk_limit(groups_spk)
-
-        # ── ASR 逐段轉錄 ─────────────────────────────────────────────
-        all_subs: list[tuple[float, float, str, str | None]] = []
-        total = len(groups_spk)
-        for i, (g0, g1, chunk, spk) in enumerate(groups_spk):
-            if progress_cb:
-                spk_info = f" [{spk}]" if spk else ""
-                progress_cb(i, total,
-                            f"[{i+1}/{total}] {g0:.1f}s~{g1:.1f}s{spk_info}")
-            max_tok = 400 if language == "Japanese" else 300
-            text = self.transcribe(chunk, max_tokens=max_tok, language=language, context=context)
-            if not text:
-                continue
-            lines = _split_to_lines(text)
-            all_subs.extend(
-                (s, e, line, spk) for s, e, line in _assign_ts(lines, g0, g1)
-            )
-
-        if not all_subs:
-            return None
-
-        # 取得輸出格式設定
-        settings = self._load_settings() if hasattr(self, '_load_settings') else {}
-        format_str = settings.get("output_format", "txt")
-        sub_format = string_to_format(format_str)
-        
-        if progress_cb:
-            progress_cb(total, total, f"寫入 {sub_format.value.upper()}…")
-
-        # 使用統一格式化模組
-        out = SRT_DIR / (audio_path.stem + ".srt")
-        actual_path = write_subtitle_file(all_subs, out, sub_format)
-        return actual_path
+            return text if get_output_simplified() else self.cc.convert(text)
 
 
 # ══════════════════════════════════════════════════════
@@ -593,7 +340,7 @@ class ASREngine1p7B(ASREngine):
             if "<asr_text>" in raw:
                 raw = raw.split("<asr_text>", 1)[1]
             text = raw.strip()
-            return text if _g_output_simplified else self.cc.convert(text)
+            return text if get_output_simplified() else self.cc.convert(text)
 
 
 # ══════════════════════════════════════════════════════
@@ -672,7 +419,7 @@ class RealtimeManager:
             )
             prob = float(out[0, 0])
 
-            if prob >= VAD_THRESHOLD:
+            if prob >= get_vad_threshold():
                 buf.append(chunk); sil = 0
             elif buf:
                 buf.append(chunk); sil += 1
@@ -1241,25 +988,23 @@ class App(ctk.CTk):
 
     def _apply_ui_prefs(self, settings: dict):
         """主執行緒：根據儲存的偏好設定同步 UI 控件與外觀。"""
-        global VAD_THRESHOLD
         mode = settings.get("appearance_mode", "dark")
         ctk.set_appearance_mode(mode)
         # VAD 閾值：從設定還原
         vad = settings.get("vad_threshold")
         if vad is not None:
-            VAD_THRESHOLD = float(vad)
+            set_vad_threshold(float(vad))
         if hasattr(self, "_settings_tab"):
             self._settings_tab.sync_prefs(settings)
 
     def _on_chinese_mode_change(self, value: str):
         """輸出模式切換：繁體（OpenCC）or 簡體（直接輸出）。"""
-        global _g_output_simplified
-        _g_output_simplified = (value == "簡體")
-        self._patch_setting("output_simplified", _g_output_simplified)
+        set_output_simplified(value == "簡體")
+        self._patch_setting("output_simplified", get_output_simplified())
         # 同步更新 chatllm_engine 模組旗標（ChatLLM 後端使用）
         if _CHATLLM_AVAILABLE:
             import chatllm_engine as _ce
-            _ce._output_simplified = _g_output_simplified
+            _ce._output_simplified = get_output_simplified()
 
     def _on_appearance_change(self, value: str):
         """主題切換：深色 🌑 or 淺色 ☀。"""
@@ -1337,12 +1082,11 @@ class App(ctk.CTk):
         self._settings = settings
 
         # 套用 UI 偏好（簡繁模式 + 外觀主題）
-        global _g_output_simplified
-        _g_output_simplified = settings.get("output_simplified", False)
+        set_output_simplified(settings.get("output_simplified", False))
         # 同步 chatllm_engine 模組旗標
         if _CHATLLM_AVAILABLE:
             import chatllm_engine as _ce
-            _ce._output_simplified = _g_output_simplified
+            _ce._output_simplified = get_output_simplified()
         self.after(0, lambda s=settings: self._apply_ui_prefs(s))
 
         # 同步 device_combo 到已儲存的裝置

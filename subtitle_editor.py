@@ -1210,7 +1210,7 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
     # ── 輸出功能 ───────────────────────────────────────────
 
     def _export_plain_text(self):
-        """???字幕所有行的文字，不含時間軸，存為 .txt。"""
+        """匯出字幕所有行的文字，不含時間軸，存為 .txt。"""
         out_path = filedialog.asksaveasfilename(
             parent=self,
             title="儲存純文字",
@@ -1241,7 +1241,7 @@ class SubtitleEditorWindow(ctk.CTkToplevel):
             messagebox.showerror("儲存失敗", str(e), parent=self)
 
     def _export_audio_segments(self):
-        """???音訊檔依字幕時間軸切残，每段存為獨立 wav。
+        """將音訊檔依字幕時間軸切段，每段存為獨立 wav。
         檔名格式： 00001-10000.wav（起始毫秒 - 結束毫秒）。
         """
         if self._audio_data is None:

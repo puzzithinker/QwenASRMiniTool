@@ -29,18 +29,17 @@ from subtitle_formatter import (
     format_to_string, string_to_format
 )
 
+from asr_common import (
+    SAMPLE_RATE, VAD_CHUNK, MAX_GROUP_SEC, MAX_CHARS, MIN_SUB_SEC, GAP_SEC,
+    detect_speech_groups, split_to_lines, assign_timestamps,
+    enforce_chunk_limit, get_output_simplified, set_srt_dir, get_srt_dir,
+)
+from engine_base import ASREngineBase
+
+
 # ── 輸出語系旗標（由 app.py / app-gpu.py 切換時同步設定）──────────────
 # True = 直接輸出模型原始簡體；False = 經 OpenCC s2twp 轉為繁體
 _output_simplified: bool = False
-
-# ── 共用常數（與 app.py 保持同步）─────────────────────────────────────
-SAMPLE_RATE   = 16000
-VAD_CHUNK     = 512
-VAD_THRESHOLD = 0.5
-MAX_GROUP_SEC = 20
-MAX_CHARS     = 20
-MIN_SUB_SEC   = 0.6
-GAP_SEC       = 0.08
 
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys.executable).parent
@@ -142,6 +141,8 @@ _LANG_CODE: dict[str, str] = {
 }
 
 SRT_DIR = BASE_DIR / "subtitles"
+set_srt_dir(SRT_DIR)
+
 
 
 # ══════════════════════════════════════════════════════
@@ -476,98 +477,12 @@ class _DLLASRRunner:
 # 輔助函式（從 app.py 複製，避免循環 import）
 # ══════════════════════════════════════════════════════
 
-def _detect_speech_groups(audio: np.ndarray, vad_sess, max_group_sec: int = MAX_GROUP_SEC):
-    h  = np.zeros((2, 1, 64), dtype=np.float32)
-    c  = np.zeros((2, 1, 64), dtype=np.float32)
-    sr = np.array(SAMPLE_RATE, dtype=np.int64)
-    n  = len(audio) // VAD_CHUNK
-    probs = []
-    for i in range(n):
-        chunk = audio[i*VAD_CHUNK:(i+1)*VAD_CHUNK].astype(np.float32)[np.newaxis, :]
-        out, h, c = vad_sess.run(None, {"input": chunk, "h": h, "c": c, "sr": sr})
-        probs.append(float(out[0, 0]))
-    if not probs:
-        return [(0.0, len(audio) / SAMPLE_RATE, audio)]
-
-    MIN_CH = 16; PAD = 5; MERGE = 16
-    raw: list[tuple[int, int]] = []
-    in_sp = False; s0 = 0
-    for i, p in enumerate(probs):
-        if p >= VAD_THRESHOLD and not in_sp:
-            s0 = i; in_sp = True
-        elif p < VAD_THRESHOLD and in_sp:
-            if i - s0 >= MIN_CH:
-                raw.append((max(0, s0-PAD), min(n, i+PAD)))
-            in_sp = False
-    if in_sp and n - s0 >= MIN_CH:
-        raw.append((max(0, s0-PAD), n))
-    if not raw:
-        return []
-
-    merged = [list(raw[0])]
-    for s, e in raw[1:]:
-        if s - merged[-1][1] <= MERGE:
-            merged[-1][1] = e
-        else:
-            merged.append([s, e])
-
-    mx_samp = max_group_sec * SAMPLE_RATE
-    groups: list[tuple[int, int]] = []
-    gs = merged[0][0] * VAD_CHUNK
-    ge = merged[0][1] * VAD_CHUNK
-    for seg in merged[1:]:
-        s = seg[0] * VAD_CHUNK; e = seg[1] * VAD_CHUNK
-        if e - gs > mx_samp:
-            groups.append((gs, ge)); gs = s
-        ge = e
-    groups.append((gs, ge))
-
-    result = []
-    for gs, ge in groups:
-        ns = max(1, int((ge - gs) // SAMPLE_RATE))
-        ch = audio[gs: gs + ns * SAMPLE_RATE].astype(np.float32)
-        if len(ch) < SAMPLE_RATE:
-            continue
-        result.append((gs / SAMPLE_RATE, gs / SAMPLE_RATE + ns, ch))
-    return result
-
-
-def _split_to_lines(text: str) -> list[str]:
-    text = text.strip()
-    if not text:
-        return []
-    parts = re.split(r"[。！？，、；：…—,.!?;:]+", text)
-    lines = []
-    for p in parts:
-        p = p.strip()
-        if not p:
-            continue
-        while len(p) > MAX_CHARS:
-            lines.append(p[:MAX_CHARS]); p = p[MAX_CHARS:]
-        lines.append(p)
-    return [l for l in lines if l.strip()]
-
-def _assign_ts(lines: list[str], g0: float, g1: float) -> list[tuple[float, float, str]]:
-    if not lines:
-        return []
-    total = sum(len(l) for l in lines)
-    if total == 0:
-        return []
-    dur = g1 - g0; res = []; cur = g0
-    for i, line in enumerate(lines):
-        end = cur + max(MIN_SUB_SEC, dur * len(line) / total)
-        if i == len(lines) - 1:
-            end = max(end, g1)
-        res.append((cur, end, line))
-        cur = end + GAP_SEC
-    return res
-
 
 # ══════════════════════════════════════════════════════
 # ChatLLMASREngine
 # ══════════════════════════════════════════════════════
 
-class ChatLLMASREngine:
+class ChatLLMASREngine(ASREngineBase):
     """
     chatllm.cpp + Vulkan 推理後端。
 
@@ -588,10 +503,7 @@ class ChatLLMASREngine:
     processor      = None   # chatllm 不用 LightProcessor，UI 偵測此為 None
 
     def __init__(self):
-        self.ready       = False
-        self.vad_sess    = None
-        self.diar_engine = None
-        self.cc          = None
+        super().__init__()
         self._runner: _DLLASRRunner | _ChatLLMRunner | None = None
         self._use_dll    = False   # 記錄目前使用哪種模式
 
@@ -727,98 +639,14 @@ class ChatLLMASREngine:
                 pass
 
         # OpenCC 簡→繁轉換（模型預設輸出簡體中文；簡體模式則跳過）
-        if self.cc and text and not _output_simplified:
+        if self.cc and text and not get_output_simplified():
             text = self.cc.convert(text)
 
         return text
 
     # ── chunk 長度限制 ─────────────────────────────────────────────────
 
-    def _enforce_chunk_limit(
-        self,
-        groups: list[tuple[float, float, np.ndarray, "str | None"]],
-    ) -> list[tuple[float, float, np.ndarray, "str | None"]]:
-        max_samples = self.max_chunk_secs * SAMPLE_RATE
-        result = []
-        for t0, t1, chunk, spk in groups:
-            if len(chunk) <= max_samples:
-                result.append((t0, t1, chunk, spk))
-            else:
-                pos = 0
-                while pos < len(chunk):
-                    piece = chunk[pos: pos + max_samples]
-                    if len(piece) < SAMPLE_RATE:
-                        break
-                    piece_t0 = t0 + pos / SAMPLE_RATE
-                    piece_t1 = min(t1, piece_t0 + len(piece) / SAMPLE_RATE)
-                    result.append((piece_t0, piece_t1, piece, spk))
-                    pos += max_samples
-        return result
-
     # ── 音檔轉 SRT ─────────────────────────────────────────────────────
-
-    def process_file(
-        self,
-        audio_path: Path,
-        progress_cb=None,
-        language:   str | None = None,
-        context:    str | None = None,
-        diarize:    bool = False,
-        n_speakers: int | None = None,
-        output_format: str = "txt",
-    ) -> Path | None:
-        import librosa
-
-        audio, _ = librosa.load(str(audio_path), sr=SAMPLE_RATE, mono=True)
-
-        # ── 分段策略：說話者分離 vs 傳統 VAD（與 ASREngine 一致）────
-        use_diar = diarize and self.diar_engine is not None and self.diar_engine.ready
-        if use_diar:
-            diar_segs = self.diar_engine.diarize(audio, n_speakers=n_speakers)
-            if not diar_segs:
-                return None
-            groups_spk = [
-                (t0, t1,
-                 audio[int(t0 * SAMPLE_RATE): int(t1 * SAMPLE_RATE)],
-                 spk)
-                for t0, t1, spk in diar_segs
-            ]
-        else:
-            vad_groups = _detect_speech_groups(audio, self.vad_sess, self.max_chunk_secs)
-            if not vad_groups:
-                return None
-            groups_spk = [(g0, g1, chunk, None) for g0, g1, chunk in vad_groups]
-
-        groups_spk = self._enforce_chunk_limit(groups_spk)
-
-        all_subs: list[tuple[float, float, str, str | None]] = []
-        total = len(groups_spk)
-        for i, (g0, g1, chunk, spk) in enumerate(groups_spk):
-            if progress_cb:
-                spk_info = f" [{spk}]" if spk else ""
-                progress_cb(i, total, f"[{i+1}/{total}] {g0:.1f}s~{g1:.1f}s{spk_info}")
-            text = self.transcribe(chunk, language=language, context=context)
-            if not text:
-                continue
-            lines = _split_to_lines(text)
-            all_subs.extend(
-                (s, e, line, spk) for s, e, line in _assign_ts(lines, g0, g1)
-            )
-
-        if not all_subs:
-            return None
-
-        # 解析輸出格式
-        sub_format = string_to_format(output_format)
-
-        if progress_cb:
-            progress_cb(total, total, f"寫入 {sub_format.value.upper()}…")
-
-        # 使用統一格式化模組
-        SRT_DIR.mkdir(exist_ok=True)
-        out = SRT_DIR / (audio_path.stem + ".srt")
-        actual_path = write_subtitle_file(all_subs, out, sub_format)
-        return actual_path
 
     def __del__(self):
         pass   # DLL runner 由 GC 自然回收（ctypes callback 會被 GC 清理）
