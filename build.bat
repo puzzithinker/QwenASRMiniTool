@@ -101,6 +101,9 @@ REM Chinese Windows (cp950 default encoding).
     --hidden-import scipy.spatial ^
     --hidden-import scipy.spatial.distance ^
     --hidden-import scipy._lib.messagestream ^
+    --hidden-import pycparser.lextab ^
+    --hidden-import pycparser.yacctab ^
+    --hidden-import scipy.special._cdflib ^
     --exclude-module torch ^
     --exclude-module torchvision ^
     --exclude-module torchaudio ^
@@ -114,6 +117,8 @@ REM Chinese Windows (cp950 default encoding).
     --add-data "%SRC%\subtitle_editor.py;." ^
     --add-data "%SRC%\setting.py;." ^
     --add-data "%SRC%\subtitle_formatter.py;." ^
+    --add-data "%SRC%\asr_common.py;." ^
+    --add-data "%SRC%\engine_base.py;." ^
     %SRC%\app.py
 
 echo.
