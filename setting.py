@@ -320,13 +320,10 @@ class SettingsTab(ctk.CTkScrollableFrame):
                      font=FONT_SMALL, text_color=("gray50", "#888888")).pack(side="left")
 
     def _on_vad_change(self, value: float):
-        """VAD 閾値即時同步到全域變數與設定檔。"""
+        """VAD 閾值即時同步到 asr_common 全域設定與設定檔。"""
         self._vad_val_var.set(f"{value:.2f}")
-        # 同步到 app 模組的 VAD_THRESHOLD
-        import sys as _sys
-        app_module = _sys.modules.get(type(self._app).__module__)
-        if app_module and hasattr(app_module, "VAD_THRESHOLD"):
-            app_module.VAD_THRESHOLD = value   # type: ignore
+        from asr_common import set_vad_threshold
+        set_vad_threshold(value)
         self._app._patch_setting("vad_threshold", round(value, 2))
 
     # ── 6. 模型路徑 ───────────────────────────────────────────────────
