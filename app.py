@@ -931,6 +931,27 @@ class App(ctk.CTk):
             if not _CHATLLM_DIR.exists():
                 # 嘗試 chatllmtest 目錄（開發模式）
                 chatllm_dir = str(BASE_DIR / "chatllmtest" / "chatllm_win_x64" / "bin")
+            
+            # 如果 chatllm 目錄不存在嘗試自動下載
+            if not Path(chatllm_dir).exists() or not (Path(chatllm_dir) / "main.exe").exists():
+                try:
+                    from downloader import quick_check_chatllm, download_chatllm_dlls
+                    # 使用 BASE_DIR 下的 chatllm 目錄
+                    download_dir = BASE_DIR / "chatllm"
+                    if not quick_check_chatllm(download_dir):
+                        # 嘗試下載
+                        download_chatllm_dlls(download_dir)
+                        chatllm_dir = str(download_dir)
+                except Exception:
+                    pass  # 下載失敗，稍後會顯示錯誤
+            
+            nvidia_amd = detect_vulkan_devices(chatllm_dir)
+        nvidia_amd: list[dict] = []
+        if _CHATLLM_AVAILABLE:
+            chatllm_dir = str(_CHATLLM_DIR)
+            if not _CHATLLM_DIR.exists():
+                # 嘗試 chatllmtest 目錄（開發模式）
+                chatllm_dir = str(BASE_DIR / "chatllmtest" / "chatllm_win_x64" / "bin")
             nvidia_amd = detect_vulkan_devices(chatllm_dir)
 
         self._all_devices = {
