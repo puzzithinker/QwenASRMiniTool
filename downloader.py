@@ -281,6 +281,18 @@ def download_chatllm_dlls(chatllm_dir: Path, progress_cb=None):
                 "或將 7z.exe 加入 PATH"
             )
 
+        # chatllm.cpp 7z 解壓後會在 bin/ 子目錄，需移動到上層
+        bin_dir = chatllm_dir / "bin"
+        if bin_dir.exists():
+            for f in bin_dir.iterdir():
+                dest = chatllm_dir / f.name
+                if not dest.exists():
+                    f.rename(dest)
+            try:
+                bin_dir.rmdir()
+            except OSError:
+                pass
+
         if progress_cb:
             progress_cb(1.0, "chatllm DLLs 就緒！")
 
