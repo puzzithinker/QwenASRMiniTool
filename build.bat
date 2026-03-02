@@ -1,26 +1,12 @@
 @echo off
 REM =======================================================
 REM  逐字稿神器 - PyInstaller Build Script (onedir mode)
-REM
-REM  OUTPUT STRUCTURE:
-REM    dist\逐字稿神器\
-REM      逐字稿神器.exe     <- launcher (~5 MB)
-REM      prompt_template.json
-REM      _internal\         <- Python runtime + packages
-REM
-REM  DISTRIBUTION:
-REM    Run setup.iss with Inno Setup to produce
-REM    逐字稿神器_Setup.exe (~400 MB installer).
-REM    Models (~1.2 GB) are downloaded at first run.
-REM
-REM  STARTUP TIME:
-REM    onedir  -> 3-5 s  (DLLs loaded directly)
-REM    onefile -> 20-35 s (must extract to %%TEMP%% first)
 REM =======================================================
+REM OUTPUT STRUCTURE:
+REM   dist\逐字稿神器\
+REM     逐字稿神器.exe     <- launcher (~5 MB)
+REM     _internal\         <- Python runtime + packages
 
-REM Use build_venv (no torch) for smaller output.
-REM Run build_venv.bat first if build_venv\ doesn't exist.
-REM Update the paths below to match your environment
 SET VENV=build_venv
 SET PYTHON=%VENV%\Scripts\python.exe
 SET SRC=.
@@ -42,76 +28,30 @@ echo openvino          : %OV_PKG%
 echo kaldi_native_fbank: %KNF_DIR%
 
 echo.
-echo === Step 2b: Ensure silero_vad_v4.onnx is present before bundling ===
-REM VAD model must exist locally so --add-data can bundle it into _internal/ov_models/
-REM If missing, download it now (small file ~2 MB from GitHub).
+echo === Step 2b: Ensure silero_vad_v4.onnx ===
 IF NOT EXIST "%SRC%\ov_models\silero_vad_v4.onnx" (
-    echo   silero_vad_v4.onnx not found, downloading...
+    echo   Downloading VAD model...
     %PYTHON% -c "from downloader import _download_file, _VAD_URL; from pathlib import Path; p=Path(r'%SRC%\ov_models'); p.mkdir(exist_ok=True); _download_file(_VAD_URL, p/'silero_vad_v4.onnx')"
-    IF ERRORLEVEL 1 (
-        echo   WARNING: VAD download failed - bundling skipped. Users will download at runtime.
-    ) ELSE (
-        echo   silero_vad_v4.onnx downloaded OK.
-    )
 ) ELSE (
-    echo   silero_vad_v4.onnx already present.
+    echo   VAD model already present.
 )
 
 echo.
-echo === Step 2c: Download chatllm DLLs for Vulkan GPU backend ===
-REM chatllm DLLs needed for Vulkan GPU backend
+echo === Step 2c: Check chatllm DLLs ===
 SET CHATLLM_READY=0
 IF EXIST "%SRC%\chatllm\libchatllm.dll" (
-    IF EXIST "%SRC%\chatllm\main.exe" (
-        SET CHATLLM_READY=1
-    )
+    IF EXIST "%SRC%\chatllm\main.exe" SET CHATLLM_READY=1
 )
 IF %CHATLLM_READY%==0 (
-    echo   Downloading chatllm DLLs for Vulkan GPU...
-    
-    REM Download 7z file using Python
-    %PYTHON% -c "import urllib.request; import ssl; url='https://github.com/foldl/chatllm.cpp/releases/download/v0.20/chatllm_win_x64.7z'; dest=r'%SRC%\chatllm_win_x64.7z'; ctx=ssl.create_default_context(); data=urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'}),context=ctx,timeout=300).read(); open(dest,'wb').write(data); print('Downloaded.', flush=True)"
-    
-    IF ERRORLEVEL 1 (
-        echo   WARNING: chatllm download failed.
-    ) ELSE (
-        REM Extract with 7z or 7za
-        SET EXTRACT_OK=0
-        where /q 7z
-        IF %ERRORLEVEL%==0 (
-            7z x -y -o"%SRC%\chatllm" "%SRC%\chatllm_win_x64.7z" 2>NUL
-            IF %ERRORLEVEL%==0 SET EXTRACT_OK=1
-        )
-        IF %EXTRACT_OK%==0 (
-            where /q 7za
-            IF %ERRORLEVEL%==0 (
-                7za x -y -o"%SRC%\chatllm" "%SRC%\chatllm_win_x64.7z" 2>NUL
-                IF %ERRORLEVEL%==0 SET EXTRACT_OK=1
-            )
-        )
-        IF %EXTRACT_OK%==1 (
-            echo   chatllm DLLs extracted.
-            IF EXIST "%SRC%\chatllm_win_x64.7z" DEL "%SRC%\chatllm_win_x64.7z"
-        ) ELSE (
-            echo   WARNING: Extract failed. GPU backend requires manual setup.
-        )
-    )
+    echo   chatllm DLLs not found.
+    echo   App will download automatically on first run.
+    echo   Or manually from: https://github.com/foldl/chatllm.cpp/releases
 ) ELSE (
-    echo   chatllm DLLs already present.
+    echo   chatllm DLLs present - will be bundled.
 )
 
 echo.
-echo === Step 3: Build with PyInstaller (onedir) ===
-
-REM --onedir is the DEFAULT (no --onefile flag).
-REM _internal/ keeps the root folder tidy (PyInstaller >= 6.0).
-
-REM prompt_template.json and mel_filters.npy are bundled inside _internal/
-REM so LightProcessor can find them via Path(__file__).parent fallback.
-
-REM runtime_hook_utf8.py: sets PYTHONUTF8=1 before any user code runs.
-REM This prevents "utf-8 codec can't decode byte 0xa6" on Traditional
-REM Chinese Windows (cp950 default encoding).
+echo === Step 3: Build with PyInstaller ===
 
 %PYTHON% -m PyInstaller ^
     --onedir ^
@@ -166,68 +106,27 @@ REM Chinese Windows (cp950 default encoding).
 
 echo.
 IF EXIST "%SRC%\dist\逐字稿神器\逐字稿神器.exe" (
-    echo ===================================================
-    echo  Build SUCCESS - Copying chatllm DLLs...
-    echo ===================================================
-
-    REM Copy chatllm DLLs + main.exe to dist\逐字稿神器\chatllm\
-    REM These are needed for Vulkan GPU backend (libchatllm.dll, ggml-vulkan.dll, etc.)
-    REM  libchatllm.dll  - newly built (2026-02-23), supports ASR models
-    REM  ggml-vulkan.dll - Vulkan GPU backend (52 MB shader kernels)
-    REM  ggml-cpu-*.dll  - CPU fallback variants (selected at runtime)
-    REM  main.exe        - used for --show_devices GPU detection only
+    echo ==================================================
+    echo  Build SUCCESS
+    echo ==================================================
 
     IF EXIST "%SRC%\chatllm" (
-        xcopy "%SRC%\chatllm\libchatllm.dll"         "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml.dll"               "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-base.dll"          "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-alderlake.dll" "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-haswell.dll"   "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-icelake.dll"   "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-sandybridge.dll" "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-skylakex.dll"  "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-sse42.dll"     "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-x64.dll"       "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-rpc.dll"           "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-vulkan.dll"        "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\libcrypto-1_1-x64.dll"  "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\libssl-1_1-x64.dll"    "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\vulkan-1.dll"            "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\main.exe"               "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q
-        echo  chatllm/    : DLLs copied to dist\逐字稿神器\chatllm\
-    ) ELSE (
-        echo  WARNING: chatllm\ not found - GPU backend will not be available
-        echo  Copy chatllm DLLs to %SRC%\chatllm\ before building.
+        xcopy "%SRC%\chatllm\*" "%SRC%\dist\逐字稿神器\chatllm\" /Y /Q /E
+        echo  chatllm/ DLLs copied.
     )
 
-    echo.
-    REM Copy bundled ffmpeg.exe to dist\逐字稿神器\ffmpeg\
-    REM ffmpeg_utils.find_ffmpeg() searches <exe_dir>/ffmpeg/ffmpeg.exe first
-    REM when running as a frozen EXE (sys.frozen=True).
     IF EXIST "%SRC%\ffmpeg\ffmpeg.exe" (
         IF NOT EXIST "%SRC%\dist\逐字稿神器\ffmpeg\" mkdir "%SRC%\dist\逐字稿神器\ffmpeg\"
         xcopy "%SRC%\ffmpeg\ffmpeg.exe" "%SRC%\dist\逐字稿神器\ffmpeg\" /Y /Q
-        echo  ffmpeg/     : ffmpeg.exe copied to dist\逐字稿神器\ffmpeg\
-    ) ELSE (
-        echo  WARNING: ffmpeg\ffmpeg.exe not found - users will be prompted to download at runtime
+        echo  ffmpeg/ copied.
     )
 
-    echo  Launcher : dist\逐字稿神器\逐字稿神器.exe
-    echo  Runtime  : dist\逐字稿神器\_internal\
-    echo  GPU DLLs : dist\逐字稿神器\chatllm\   (~71 MB, Vulkan backend)
-    echo  ffmpeg   : dist\逐字稿神器\ffmpeg\ffmpeg.exe  (video support)
-    echo  WebUI    : use app-gpu.py (start-gpu.bat) for Streamlit service
     echo.
-    echo  Model downloaded at first run from:
-    echo    https://huggingface.co/dseditor/Collection/resolve/main/qwen3-asr-1.7b.bin
-    echo  Saved to: {app}\GPUModel\qwen3-asr-1.7b.bin  (~2.3 GB)
-    echo.
-    echo  Next step: open setup.iss with Inno Setup
-    echo  to produce 逐字稿神器_Setup.exe for distribution.
-    echo ===================================================
+    echo  Output: dist\逐字稿神器\
+    echo  Next: Run setup.iss with Inno Setup to create installer.
 ) ELSE (
-    echo ===================================================
-    echo  Build FAILED. Check output above.
-    echo ===================================================
+    echo ==================================================
+    echo  Build FAILED
+    echo ==================================================
 )
 pause
