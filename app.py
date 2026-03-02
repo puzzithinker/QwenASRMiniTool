@@ -1374,6 +1374,18 @@ class App(ctk.CTk):
                     cl_dir = _CHATLLM_DIR if _CHATLLM_DIR.exists() else \
                              BASE_DIR / "chatllmtest" / "chatllm_win_x64" / "bin"
 
+                    # 檢查 chatllm DLLs 是否存在，不存在則自動下載
+                    from downloader import quick_check_chatllm, download_chatllm_dlls
+                    if not quick_check_chatllm(cl_dir):
+                        self._set_status("⬇ 下載 chatllm DLLs（~10 MB）…")
+                        try:
+                            download_chatllm_dlls(cl_dir, progress_cb=_onb_progress)
+                        except Exception as e:
+                            raise RuntimeError(f"chatllm DLLs 下載失敗：{e}")
+
+                    cl_dir = _CHATLLM_DIR if _CHATLLM_DIR.exists() else \
+                             BASE_DIR / "chatllmtest" / "chatllm_win_x64" / "bin"
+
                     # 選取的 GPU device
                     gpu_label = gpu_var.get()   # e.g. "GPU:0 (NVIDIA...) [Vulkan]"
 
@@ -1465,6 +1477,30 @@ class App(ctk.CTk):
             _saved_mdl  = settings.get("model_path") or settings.get("gguf_path") or str(_BIN_PATH)
             model_path  = Path(_saved_mdl)
             chatllm_dir = Path(settings.get("chatllm_dir", str(_CHATLLM_DIR)))
+
+            # 檢查 chatllm DLLs 是否存在，不存在則自動下載
+            from downloader import quick_check_chatllm, download_chatllm_dlls
+            if not quick_check_chatllm(chatllm_dir):
+                self.after(0, self._show_dl_bar)
+                self._set_status("⬇ 下載 chatllm DLLs（~10 MB）…")
+                try:
+                    def _on_dl_progress(pct, msg):
+                        self._on_dl_progress(pct, msg)
+                    download_chatllm_dlls(chatllm_dir, progress_cb=_on_dl_progress)
+                    self.after(0, self._hide_dl_bar)
+                except Exception as e:
+                    msg = str(e)
+                    self.after(0, self._hide_dl_bar)
+                    self.after(0, lambda: messagebox.showerror(
+                        "下載失敗",
+                        f"chatllm DLLs 下載失敗：\n{msg}\n\n"
+                        "請確認網路連線後點「重新載入」重試，或手动下载：\n"
+                        "https://github.com/foldl/chatllm.cpp/releases",
+                    ))
+                    self.after(0, lambda: self._set_status("❌ 下載失敗"))
+                    self.after(0, lambda: self.reload_btn.configure(state="normal"))
+                    return
+
 
             # chatllm .bin 是否存在
             if not model_path.exists():

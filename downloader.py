@@ -12,6 +12,13 @@ from __future__ import annotations
 
 import hashlib
 import ssl
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -185,6 +192,104 @@ def download_diarization(diar_dir: Path, progress_cb=None):
     if progress_cb:
         progress_cb(1.0, "說話者分離模型下載完成！")
 
+import tempfile
+import shutil
+
+_CHATLLM_DLL_URL = "https://github.com/foldl/chatllm.cpp/releases/download/v0.20/chatllm_win_x64.7z"
+
+
+def quick_check_chatllm(chatllm_dir: Path) -> bool:
+    """快速檢查 chatllm DLLs 是否存在。"""
+    if not chatllm_dir.exists():
+        return False
+    # 必要檔案
+    required = ["libchatllm.dll", "main.exe"]
+    # 可選但建議有（Vulkan GPU 用）
+    optional = ["ggml-vulkan.dll", "ggml.dll", "ggml-base.dll"]
+    # 至少要有必要檔案
+    return all((chatllm_dir / f).exists() for f in required)
+
+
+def download_chatllm_dlls(chatllm_dir: Path, progress_cb=None):
+    """
+    下載並解壓縮 chatllm DLLs 至 chatllm_dir。
+    progress_cb(pct: float, msg: str)   pct ∈ [0, 1]
+    下載失敗時拋出例外。
+    """
+    chatllm_dir.mkdir(parents=True, exist_ok=True)
+
+    if progress_cb:
+        progress_cb(0.0, "下載 chatllm DLLs...")
+
+    # 下載 7z 檔案
+    with tempfile.NamedTemporaryFile(suffix=".7z", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        # 下載
+        def _dl_cb(done: int, total: int):
+            if progress_cb and total > 0:
+                pct = 0.5 * done / total  # 前 50% 給下載
+                progress_cb(pct, f"下載中... {done/1_048_576:.1f} / {total/1_048_576:.1f} MB")
+
+        _download_file(_CHATLLM_DLL_URL, tmp_path, progress_cb=_dl_cb)
+
+        if progress_cb:
+            progress_cb(0.5, "解壓縮中...")
+
+        # 解壓縮嘗試
+        extracted_ok = False
+
+        # 方法1: 嘗試使用 py7zlib
+        try:
+            import py7zlib
+            with open(tmp_path, "rb") as f:
+                archive = py7zlib.Py7zFile(f)
+                archive.extractall(str(chatllm_dir))
+            extracted_ok = True
+        except Exception:
+            pass
+
+        # 方法2: 嘗試使用系統的 7z.exe
+        if not extracted_ok:
+            try:
+                # 嘗試從 PATH 或常見位置找 7z
+                sevenz_paths = ["7z", "7z.exe"]
+                # 也檢查程式目錄下是否有
+                exe_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+                sevenz_paths.append(str(exe_dir / "7z.exe"))
+                sevenz_paths.append(str(exe_dir / "7za.exe"))
+
+                for sz_cmd in sevenz_paths:
+                    try:
+                        result = subprocess.run(
+                            [sz_cmd, "x", "-y", "-o" + str(chatllm_dir), str(tmp_path)],
+                            capture_output=True, timeout=120
+                        )
+                        if result.returncode == 0:
+                            extracted_ok = True
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        if not extracted_ok:
+            raise RuntimeError(
+                "無法解壓縮 7z 檔案。請安裝 7-Zip 或 py7zlib：\n"
+                "pip install py7zlib\n"
+                "或將 7z.exe 加入 PATH"
+            )
+
+        if progress_cb:
+            progress_cb(1.0, "chatllm DLLs 就緒！")
+
+    finally:
+        # 清理臨時檔
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 def quick_check_1p7b(model_dir: Path) -> bool:
     """快速檢查 1.7B KV-cache INT8 模型是否完整（非 LFS pointer）。"""

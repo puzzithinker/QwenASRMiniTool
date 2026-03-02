@@ -58,14 +58,57 @@ IF NOT EXIST "%SRC%\ov_models\silero_vad_v4.onnx" (
 )
 
 echo.
+echo === Step 2c: Download chatllm DLLs for Vulkan GPU backend ===
+REM chatllm DLLs needed for Vulkan GPU backend
+SET CHATLLM_READY=0
+IF EXIST "%SRC%\chatllm\libchatllm.dll" (
+    IF EXIST "%SRC%\chatllm\main.exe" (
+        SET CHATLLM_READY=1
+    )
+)
+IF %CHATLLM_READY%==0 (
+    echo   Downloading chatllm DLLs for Vulkan GPU...
+    
+    REM Download 7z file using Python
+    %PYTHON% -c "import urllib.request; import ssl; url='https://github.com/foldl/chatllm.cpp/releases/download/v0.20/chatllm_win_x64.7z'; dest=r'%SRC%\chatllm_win_x64.7z'; ctx=ssl.create_default_context(); data=urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'}),context=ctx,timeout=300).read(); open(dest,'wb').write(data); print('Downloaded.', flush=True)"
+    
+    IF ERRORLEVEL 1 (
+        echo   WARNING: chatllm download failed.
+    ) ELSE (
+        REM Extract with 7z or 7za
+        SET EXTRACT_OK=0
+        where /q 7z
+        IF %ERRORLEVEL%==0 (
+            7z x -y -o"%SRC%\chatllm" "%SRC%\chatllm_win_x64.7z" 2>NUL
+            IF %ERRORLEVEL%==0 SET EXTRACT_OK=1
+        )
+        IF %EXTRACT_OK%==0 (
+            where /q 7za
+            IF %ERRORLEVEL%==0 (
+                7za x -y -o"%SRC%\chatllm" "%SRC%\chatllm_win_x64.7z" 2>NUL
+                IF %ERRORLEVEL%==0 SET EXTRACT_OK=1
+            )
+        )
+        IF %EXTRACT_OK%==1 (
+            echo   chatllm DLLs extracted.
+            IF EXIST "%SRC%\chatllm_win_x64.7z" DEL "%SRC%\chatllm_win_x64.7z"
+        ) ELSE (
+            echo   WARNING: Extract failed. GPU backend requires manual setup.
+        )
+    )
+) ELSE (
+    echo   chatllm DLLs already present.
+)
+
+echo.
 echo === Step 3: Build with PyInstaller (onedir) ===
 
 REM --onedir is the DEFAULT (no --onefile flag).
 REM _internal/ keeps the root folder tidy (PyInstaller >= 6.0).
-REM
+
 REM prompt_template.json and mel_filters.npy are bundled inside _internal/
 REM so LightProcessor can find them via Path(__file__).parent fallback.
-REM
+
 REM runtime_hook_utf8.py: sets PYTHONUTF8=1 before any user code runs.
 REM This prevents "utf-8 codec can't decode byte 0xa6" on Traditional
 REM Chinese Windows (cp950 default encoding).
